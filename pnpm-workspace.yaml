@@ -1,0 +1,21 @@
+$schema: https://pnpm.io/pnpm-workspace.schema.json
+# pnpm 11 构建审批：仅允许这些依赖运行安装期脚本
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+  vue-demi: true
+  workerd: true
+# eslint 10 发布时间早于最低发布龄要求，按 pnpm 提示豁免
+minimumReleaseAgeExclude:
+  - eslint@10.11.0
+minimumReleaseAgeExcludePrune: true
+# 与本机全局配置一致的信任策略（pnpm install 时写入）
+trustPolicy: no-downgrade
+shellEmulator: true
+# semver@6.3.1（@babel/core 的传递依赖）发布于 2023 年且无 provenance，
+# 被 trustPolicy: no-downgrade 判为信任降级；semver@6 系列从未带 provenance，
+# 属 pnpm 已知情况（pnpm/pnpm#10202）。仅针对该版本豁免，不放宽整体策略。
+trustPolicyExclude:
+  - semver@6.3.1

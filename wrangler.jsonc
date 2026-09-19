@@ -1,0 +1,13 @@
+{
+  // Cloudflare Workers 本地预览与部署配置（不含任何密钥；
+  // NUXT_TYPESAFE_API_KEY 通过 wrangler secret put 注入）
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "uno-jev",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": ".output/server/index.mjs",
+  "assets": {
+    "directory": ".output/public",
+    "binding": "ASSETS"
+  }
+}
