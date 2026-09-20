@@ -267,6 +267,8 @@ export function validateState(state: unknown): ValidationResult {
     errors.push('revision 必须是非负安全整数')
   }
 
+  // 结构良好的玩家：后续阶段校验（after-draw / finished / 空手检查）只在成立时深入读取字段
+  let playersWellFormed = Array.isArray(state.players) && state.players.length === 4
   if (!Array.isArray(state.players) || state.players.length !== 4) {
     errors.push('players 必须固定 4 个座位')
   }
@@ -275,6 +277,7 @@ export function validateState(state: unknown): ValidationResult {
       const player = state.players[i] as unknown
       if (!isPlainObject(player) || player.id !== PLAYER_IDS[i]) {
         errors.push(`players[${i}].id 必须为 ${PLAYER_IDS[i]}（座位顺序固定）`)
+        playersWellFormed = false
         continue
       }
       if (player.type !== DEFAULT_PLAYER_TYPES[PLAYER_IDS[i]!]) {
@@ -365,9 +368,12 @@ export function validateState(state: unknown): ValidationResult {
     errors.push('未结束状态 blockedTurnCount 必须为 0..3')
   }
   if (!isFinished && Array.isArray(state.players)) {
-    for (const player of state.players as Array<{ id: string, hand?: string[] }>) {
+    for (const player of state.players as unknown[]) {
+      if (!isPlainObject(player)) {
+        continue
+      }
       if (Array.isArray(player.hand) && player.hand.length === 0) {
-        errors.push(`未结束时任何玩家手牌都非空（${player.id}）`)
+        errors.push(`未结束时任何玩家手牌都非空（${String(player.id)}）`)
       }
     }
   }
@@ -387,9 +393,11 @@ export function validateState(state: unknown): ValidationResult {
         if (state.direction !== 1) {
           errors.push('opening-color 阶段方向必须为 1')
         }
-        const expectedChooser = nextPlayerOf(PLAYER_IDS, 1, state.dealerId as PlayerId)
-        if (state.currentPlayerId !== expectedChooser) {
-          errors.push('opening-color 阶段行动者必须是庄家左侧玩家')
+        if (PLAYER_IDS.includes(state.dealerId as PlayerId)) {
+          const expectedChooser = nextPlayerOf(PLAYER_IDS, 1, state.dealerId as PlayerId)
+          if (state.currentPlayerId !== expectedChooser) {
+            errors.push('opening-color 阶段行动者必须是庄家左侧玩家')
+          }
         }
         break
       }
@@ -405,7 +413,7 @@ export function validateState(state: unknown): ValidationResult {
         }
         const drawnCardId = phase.drawnCardId
         const current = Array.isArray(state.players)
-          ? (state.players as Array<{ id: string, hand: string[] }>).find(p => p.id === state.currentPlayerId)
+          ? (state.players as unknown[]).find(p => isPlainObject(p) && p.id === state.currentPlayerId) as { id: string, hand?: string[] } | undefined
           : undefined
         if (typeof drawnCardId !== 'string' || getCard(drawnCardId) === null) {
           errors.push('after-draw 阶段 drawnCardId 必须是目录内 CardId')
@@ -413,7 +421,7 @@ export function validateState(state: unknown): ValidationResult {
         else if (!current?.hand?.includes(drawnCardId)) {
           errors.push('after-draw.drawnCardId 必须在当前手牌中')
         }
-        else if (current) {
+        else if (current && playersWellFormed) {
           const ctx = buildDecisionContextFromState(state as unknown as GameState)
           if (ctx && !isDrawnCardPlayable(ctx, drawnCardId)) {
             errors.push('after-draw.drawnCardId 必须是可出的牌')
@@ -433,8 +441,8 @@ export function validateState(state: unknown): ValidationResult {
             errors.push('empty-hand 结果必须携带合法 winnerId')
           }
           else if (Array.isArray(state.players)) {
-            const emptyHands = (state.players as Array<{ id: string, hand: string[] }>).filter(p => p.hand.length === 0)
-            if (emptyHands.length !== 1 || emptyHands[0]?.id !== winnerId) {
+            const emptyHands = (state.players as unknown[]).filter(p => isPlainObject(p) && Array.isArray(p.hand) && p.hand.length === 0)
+            if (emptyHands.length !== 1 || (emptyHands[0] as { id?: string })?.id !== winnerId) {
               errors.push('空手胜者必须唯一且与 winnerId 一致')
             }
           }

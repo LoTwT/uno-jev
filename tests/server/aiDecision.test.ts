@@ -547,3 +547,82 @@ describe('buildUpstreamPayload', () => {
     }
   })
 })
+
+describe('超时覆盖响应正文读取（问题 7 回归）', () => {
+  /** 假上游：响应头立即返回，正文在 delayMs 后到达；abort 时终止流。 */
+  function slowBodyFetch(delayMs: number, body: string) {
+    const impl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const timer = setTimeout(() => {
+            controller.enqueue(encoder.encode(body))
+            controller.close()
+          }, delayMs)
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer)
+            controller.error(new DOMException('Aborted', 'AbortError'))
+          })
+        },
+      })
+      return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    return impl
+  }
+
+  it('响应头及时但正文超时：50ms 预算下正文延迟 300ms → 504 ai_timeout（旧版会返回 200）', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    const body = JSON.stringify(successBody(request.candidates))
+    const result = await handleAiDecision(baseParams(request, {
+      fetchImpl: slowBodyFetch(300, body),
+      upstreamTimeoutMs: 50,
+    }))
+    expect(result.status).toBe(504)
+    expect(result.body).toEqual({ error: { code: 'ai_timeout' }, decisionId: request.decisionId })
+  })
+
+  it('正文在预算内到达：仍返回 200（超时保护不误伤正常响应）', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    const body = JSON.stringify(successBody(request.candidates))
+    const result = await handleAiDecision(baseParams(request, {
+      fetchImpl: slowBodyFetch(20, body),
+      upstreamTimeoutMs: 500,
+    }))
+    expect(result.status).toBe(200)
+    if (!('error' in result.body)) {
+      expect(result.body.actionId).toBe(request.candidates[0]!.id)
+    }
+  })
+
+  it('正文读取中断（未超时）→ 502 ai_upstream_error，且不透传上游内容', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    const impl = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new TypeError('socket hang up'))
+        },
+      })
+      return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const result = await handleAiDecision(baseParams(request, { fetchImpl: impl, upstreamTimeoutMs: 500 }))
+    expect(result.status).toBe(502)
+    expect(result.body).toEqual({ error: { code: 'ai_upstream_error' }, decisionId: request.decisionId })
+  })
+
+  it('正文超时只发起一次上游请求（不重试）', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    let calls = 0
+    const base = slowBodyFetch(300, JSON.stringify(successBody(request.candidates)))
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls++
+      return base(url, init)
+    }) as typeof fetch
+    const result = await handleAiDecision(baseParams(request, { fetchImpl: impl, upstreamTimeoutMs: 50 }))
+    expect(result.status).toBe(504)
+    expect(calls).toBe(1)
+  })
+})

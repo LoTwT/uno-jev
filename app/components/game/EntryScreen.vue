@@ -4,15 +4,19 @@
  * 单局、无叠加、严格 +4、AI 自动抓漏。
  */
 import type { GameState } from '#shared/game'
+import { computed } from 'vue'
 
 const props = defineProps<{
   hasValidSave: boolean
   savedState: GameState | null
+  /** 浏览器存储不可访问：对局无法保存，只提供不保存的临时对局。 */
+  storageUnavailable?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'start'): void
   (e: 'continue'): void
+  (e: 'startTemp'): void
   (e: 'showRules'): void
 }>()
 
@@ -53,8 +57,17 @@ const saveSummary = computed(() => {
       </button>
     </div>
 
+    <!-- 存储不可用：明确说明并提供不保存的临时对局 -->
+    <div
+      v-if="props.storageUnavailable"
+      class="mb-4 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-fg)] p-3 text-sm"
+      role="status"
+    >
+      此浏览器不允许本地存储，对局无法保存（刷新后不会保留）。可以开始一局不保存的临时对局。
+    </div>
+
     <!-- 有效存档的继续入口 -->
-    <div v-if="hasValidSave && saveSummary" class="mb-4">
+    <div v-if="hasValidSave && saveSummary && !props.storageUnavailable" class="mb-4">
       <button
         type="button"
         class="w-full min-h-12 px-5 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-contrast)] font-semibold hover:bg-[var(--accent-primary-hover)] transition-colors"
@@ -65,6 +78,15 @@ const saveSummary = computed(() => {
     </div>
 
     <button
+      v-if="props.storageUnavailable"
+      type="button"
+      class="w-full min-h-12 px-5 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-contrast)] font-semibold hover:bg-[var(--accent-primary-hover)] transition-colors"
+      @click="emit('startTemp')"
+    >
+      开始临时对局（不保存）
+    </button>
+    <button
+      v-else
       type="button"
       class="w-full min-h-12 px-5 rounded-xl border-2 border-[var(--border-strong)] font-semibold hover:bg-[var(--surface-subtle)] transition-colors"
       :class="hasValidSave ? '' : 'bg-[var(--accent-primary)] text-[var(--accent-contrast)] border-transparent hover:bg-[var(--accent-primary-hover)]'"

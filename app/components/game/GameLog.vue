@@ -4,6 +4,7 @@
  * 兜底标识持续可见，不只闪现一次 toast。
  */
 import type { Player, PublicEvent } from '#shared/game'
+import { computed } from 'vue'
 import { eventDescription } from '~/utils/display'
 
 const props = defineProps<{

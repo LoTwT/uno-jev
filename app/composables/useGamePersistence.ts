@@ -11,6 +11,7 @@ import type { GameState, SaveEnvelopeV1, SaveLoadResult } from '#shared/game'
 import { useLocalStorage } from '@vueuse/core'
 import { readonly, ref } from 'vue'
 import { loadSaveEnvelope } from '#shared/game'
+import { localStorageAccessible, storageWindow } from '~/utils/storage'
 
 export const SAVE_KEY = 'unojev:save'
 
@@ -34,6 +35,8 @@ export interface GamePersistence {
   rawSlotExists: Readonly<Ref<boolean>>
   /** 最近一次持久化是否成功；memory-only 表示不再尝试写共享槽位。 */
   saveHealth: Readonly<Ref<SaveHealth>>
+  /** 浏览器存储是否可访问；不可用时界面明确提供不保存的临时对局。 */
+  storageAvailable: Readonly<Ref<boolean>>
   /** 最后成功读取 / 保存的槽位签名，用于外部修改检测。 */
   lastKnownSignature: Readonly<Ref<SaveSignature | null>>
   loadInitial: () => InitialLoad
@@ -49,9 +52,27 @@ export interface GamePersistence {
   readForDisplay: () => InitialLoad
 }
 
+/** envelope 的槽位签名；会话层与页面用它比较"用户确认过的版本"。 */
+export function envelopeSignature(envelope: SaveEnvelopeV1): SaveSignature {
+  return {
+    gameId: envelope.state.gameId,
+    revision: envelope.state.revision,
+    writerId: envelope.writerId,
+  }
+}
+
+/** 两个签名是否指向同一版本（gameId / revision / writerId 全部一致）。 */
+export function sameSignature(a: SaveSignature | null, b: SaveSignature | null): boolean {
+  if (a === null || b === null) {
+    return a === b
+  }
+  return a.gameId === b.gameId && a.revision === b.revision && a.writerId === b.writerId
+}
+
 export function useGamePersistence(): GamePersistence {
   const rawSlotExists = ref(false)
   const saveHealth = ref<SaveHealth>('ok')
+  const storageAvailable = ref(localStorageAccessible())
   const lastKnownSignature = ref<SaveSignature | null>(null)
 
   // 写失败检测：VueUse 的 write 内部捕获 setItem 异常并调用 onError
@@ -86,13 +107,20 @@ export function useGamePersistence(): GamePersistence {
     initOnMounted: true,
     listenToStorageChanges: false,
     onError,
+    // 存储属性访问本身可能抛 SecurityError：不可用时传 null，VueUse 回退为内存 ref
+    window: storageWindow(),
   })
 
   function signatureOf(env: SaveEnvelopeV1): SaveSignature {
-    return { gameId: env.state.gameId, revision: env.state.revision, writerId: env.writerId }
+    return envelopeSignature(env)
   }
 
   function readRaw(): string | null {
+    if (!localStorageAccessible()) {
+      storageAvailable.value = false
+      return null
+    }
+    storageAvailable.value = true
     try {
       return window.localStorage.getItem(SAVE_KEY)
     }
@@ -170,6 +198,10 @@ export function useGamePersistence(): GamePersistence {
   }
 
   function verifySlot(): 'ok' | 'missing' | 'conflict' | 'storage-error' {
+    if (!localStorageAccessible()) {
+      storageAvailable.value = false
+      return 'storage-error'
+    }
     let raw: string | null
     try {
       raw = window.localStorage.getItem(SAVE_KEY)
@@ -226,6 +258,7 @@ export function useGamePersistence(): GamePersistence {
   return {
     rawSlotExists: readonly(rawSlotExists),
     saveHealth: readonly(saveHealth),
+    storageAvailable: readonly(storageAvailable),
     lastKnownSignature: readonly(lastKnownSignature),
     loadInitial,
     persist,

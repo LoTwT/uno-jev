@@ -3,6 +3,7 @@
  * 结束页：给出胜者或和局原因，以及再来一局的操作。
  */
 import type { GameState, Player } from '#shared/game'
+import { computed } from 'vue'
 
 const props = defineProps<{
   state: GameState

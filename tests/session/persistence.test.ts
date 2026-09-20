@@ -206,6 +206,78 @@ describe('写入失败处理（S3）', () => {
     wrapper.unmount()
   })
 
+  it('持续配额不足：重试保存失败保持当前对局与失败入口，不进入槽位冲突（问题 3 回归）', async () => {
+    const fake = new FakeStorage()
+    const restoreStorage = installStorage(fake)
+    try {
+      const { wrapper, session } = mountSession()
+      await settle()
+      session().startNewGame()
+      await settle()
+      expect(session().persistence.saveHealth.value).toBe('ok')
+      const firstRaw = readSlot()!
+
+      // 写入开始持续失败
+      fake.failSet = true
+      const humanTurn = session().state.value!.currentPlayerId === 'p0' && session().state.value!.phase.kind === 'turn'
+      if (humanTurn) {
+        session().drawOne()
+      }
+      else {
+        // AI 先手：直接持久化一个推进过的快照触发失败
+        const bumped = { ...structuredClone(session().state.value!), revision: session().state.value!.revision + 1 }
+        session().persistence.persist(bumped, session().writerId)
+      }
+      await settle()
+      expect(session().persistence.saveHealth.value).toBe('failed')
+      const memoryRevision = session().state.value!.revision
+
+      // 重试仍失败：必须保持 playing + failed，而不是 slot-conflict
+      session().retrySave()
+      await settle()
+      expect(session().status.value, '持续写入失败不应进入槽位冲突').toBe('playing')
+      expect(session().persistence.saveHealth.value).toBe('failed')
+      // 内存进度保留，旧槽位未被破坏
+      expect(session().state.value!.revision).toBe(memoryRevision)
+      expect(readSlot()).toBe(firstRaw)
+
+      // 失败提示条的两个入口仍可用：仅此页继续
+      session().continueInMemoryOnly()
+      await settle()
+      expect(session().persistence.saveHealth.value).toBe('memory-only')
+      expect(session().status.value).toBe('playing')
+
+      // 存储恢复后（新局路径）保存重新可用：重试保存入口在 failed 状态下依然工作
+      const { wrapper: wrapper2, session: session2 } = mountSession()
+      await settle()
+      // 槽位里还有上一个会话的进行中对局：按新局保护先确认覆盖
+      expect(await session2().startNewGame()).toBe('needs-confirmation')
+      expect(await session2().startNewGame(session2().currentSlotSignature())).toBe('started')
+      await settle()
+      fake.failSet = true
+      const humanTurn2 = session2().state.value!.currentPlayerId === 'p0' && session2().state.value!.phase.kind === 'turn'
+      if (humanTurn2) {
+        session2().drawOne()
+      }
+      else {
+        const bumped2 = { ...structuredClone(session2().state.value!), revision: session2().state.value!.revision + 1 }
+        session2().persistence.persist(bumped2, session2().writerId)
+      }
+      await settle()
+      expect(session2().persistence.saveHealth.value).toBe('failed')
+      fake.failSet = false
+      session2().retrySave()
+      await settle()
+      expect(session2().persistence.saveHealth.value).toBe('ok')
+      expect(session2().status.value).toBe('playing')
+      wrapper2.unmount()
+      wrapper.unmount()
+    }
+    finally {
+      restoreStorage()
+    }
+  })
+
   it('storage 一开始就不可用：同样进入受控失败状态而非崩溃', async () => {
     const fake = new FakeStorage()
     fake.failSet = true

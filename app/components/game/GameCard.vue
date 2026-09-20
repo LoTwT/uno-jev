@@ -4,6 +4,7 @@
  * 纯展示组件；交互（点击、焦点）由父组件的按钮承担。
  */
 import type { Card } from '#shared/game'
+import { computed } from 'vue'
 import { cardLabel, cardSymbol, COLOR_NAMES } from '~/utils/display'
 
 const props = withDefaults(defineProps<{

@@ -4,6 +4,7 @@
  * 当前颜色与方向都有文字，不仅依赖色相。
  */
 import type { Card, Color } from '#shared/game'
+import { computed } from 'vue'
 import { COLOR_NAMES } from '~/utils/display'
 
 const props = defineProps<{

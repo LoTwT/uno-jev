@@ -4,6 +4,7 @@
  * 失败时提示"本局暂未保存，刷新会丢失新进度"并提供重试 / 仅此页继续。
  */
 import type { SaveHealth } from '~/composables/useGamePersistence'
+import { computed } from 'vue'
 
 const props = defineProps<{
   health: SaveHealth

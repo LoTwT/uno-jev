@@ -10,7 +10,7 @@ import type {
   PlayerId,
   PublicEvent,
 } from '#shared/game'
-import type { InitialLoad } from './useGamePersistence'
+import type { InitialLoad, SaveSignature } from './useGamePersistence'
 /**
  * 对局会话编排：持有唯一当前状态、串行提交命令、派生 UI 数据，
  * 连接规则引擎、持久化、多标签页控制与 AI 调度。
@@ -22,7 +22,7 @@ import { computed, onMounted, ref, shallowRef } from 'vue'
 import { applyAction, createGame, getCard, isWildKind } from '#shared/game'
 import { useAiTurn } from './useAiTurn'
 import { useGameLock, webLocksSupported } from './useGameLock'
-import { useGamePersistence } from './useGamePersistence'
+import { envelopeSignature, sameSignature, useGamePersistence } from './useGamePersistence'
 
 export type SessionStatus
   = | 'boot'
@@ -34,6 +34,9 @@ export type SessionStatus
     | 'slot-conflict'
 
 export type ControlMode = 'locked' | 'temp'
+
+/** 新开一局的会话结果：需要用户确认覆盖时返回 needs-confirmation。 */
+export type StartNewGameResult = 'started' | 'needs-confirmation' | 'blocked'
 
 export interface HandCardView {
   card: Card
@@ -92,11 +95,15 @@ export function useUnoGame() {
   })
 
   // ---- 串行命令队列 -------------------------------------------------------
-  let queue: Promise<void> = Promise.resolve()
-  function enqueue(run: () => void) {
-    queue = queue.then(run).catch((error) => {
+  let queue: Promise<unknown> = Promise.resolve()
+  /** 串行执行命令并返回其结果；异常被捕获记录，调用方无需处理拒绝。 */
+  function enqueue<T>(run: () => T | Promise<T>): Promise<T | undefined> {
+    const result = queue.then(run).catch((error) => {
       console.error('[unojev] 命令执行异常:', error)
+      return undefined
     })
+    queue = result
+    return result
   }
 
   // ---- 保存与冲突 ---------------------------------------------------------
@@ -131,10 +138,11 @@ export function useUnoGame() {
     if (controlMode.value === 'locked' && !lock.held.value) {
       return false
     }
-    // 持锁期间比较持久化槽位与最后成功读取 / 保存的签名
+    // 持锁期间比较持久化槽位与最后成功读取 / 保存的签名；
+    // 仅签名确实变化（外部改写 / 删除）才按冲突处理，存储读取异常留给写入失败路径
     if (controlMode.value === 'locked' && persistence.saveHealth.value !== 'memory-only') {
       const verify = persistence.verifySlot()
-      if (verify !== 'ok') {
+      if (verify === 'conflict' || verify === 'missing') {
         handleSlotProblem(verify)
         return false
       }
@@ -222,27 +230,59 @@ export function useUnoGame() {
     }
   }
 
-  /** 入口操作前确保持有控制权（返回入口释放后可重新争取）。 */
+  /**
+   * 入口操作前确保持有控制权（返回入口释放后可重新争取）。
+   * 取得锁后重新读取最新存档：其他标签页可能在本页释放锁期间写入新进度。
+   */
   async function ensureControl(): Promise<boolean> {
     if (controlMode.value === 'temp') {
       return true
     }
-    if (lock.held.value) {
-      return true
+    if (!lock.held.value) {
+      const granted = await lock.request()
+      if (!granted) {
+        // 其他标签页仍持有：保持入口 / 只读状态
+        entrySave.value = persistence.readForDisplay()
+        status.value = webLocksSupported() ? 'readonly-locked' : 'no-lock-browser'
+        return false
+      }
     }
-    // 重新争取锁；失败（其他标签页仍持有）时保持入口/只读状态
-    const granted = await lock.request()
-    if (!granted) {
-      entrySave.value = persistence.readForDisplay()
-      status.value = webLocksSupported() ? 'readonly-locked' : 'no-lock-browser'
-    }
-    return granted
+    entrySave.value = persistence.loadInitial()
+    return true
   }
 
-  function startNewGame() {
-    void enqueue(async () => {
+  /** 当前槽位对应的版本签名；用于"用户确认过的版本"比较。 */
+  function currentSlotSignature(): SaveSignature | null {
+    if (status.value === 'playing') {
+      return persistence.lastKnownSignature.value
+    }
+    const load = entrySave.value
+    if (load.status === 'valid' && load.envelope) {
+      return envelopeSignature(load.envelope)
+    }
+    return persistence.lastKnownSignature.value
+  }
+
+  /** 槽位是否存在需要用户确认才可覆盖的内容（进行中的对局或无法读取的存档）。 */
+  function slotNeedsConfirmation(): boolean {
+    const load = entrySave.value
+    if (load.status === 'invalid') {
+      return true
+    }
+    if (load.status === 'valid' && load.envelope) {
+      return load.envelope.state.phase.kind !== 'finished'
+    }
+    return false
+  }
+
+  async function startNewGame(confirmedSignature?: SaveSignature | null): Promise<StartNewGameResult> {
+    const result = await enqueue(async (): Promise<StartNewGameResult> => {
       if (!(await ensureControl())) {
-        return
+        return 'blocked'
+      }
+      // 写入前检查槽位是否仍对应用户确认过的版本；变化时更新界面并要求重新确认
+      if (slotNeedsConfirmation() && !sameSignature(currentSlotSignature(), confirmedSignature ?? null)) {
+        return 'needs-confirmation'
       }
       aiTurn.cancelAll()
       const game = createGame({ gameId: freshUuid() })
@@ -251,7 +291,10 @@ export function useUnoGame() {
       // 立即保存首个快照；失败时暂停自动推进并呈现重试入口
       persistCurrent()
       aiTurn.schedule()
+      return 'started'
     })
+    // 队列异常已由 enqueue 记录；此处按"未开始"处理，界面保持原状态
+    return result ?? 'blocked'
   }
 
   function continueGame() {
@@ -259,9 +302,9 @@ export function useUnoGame() {
       if (!(await ensureControl())) {
         return
       }
+      // ensureControl 已按最新槽位刷新 entrySave；这里直接使用该权威快照
       let envelope = entrySave.value.status === 'valid' ? entrySave.value.envelope : undefined
       if (!envelope) {
-        // 入口的存档引用可能过期，重新读取一次
         const fresh = persistence.readForDisplay()
         entrySave.value = fresh
         envelope = fresh.status === 'valid' ? fresh.envelope : undefined
@@ -330,9 +373,13 @@ export function useUnoGame() {
       // 重试前检查旧槽位仍匹配本页最后成功保存的签名；不匹配按冲突处理
       if (persistence.retrySave(state.value, writerId)) {
         aiTurn.schedule()
+        return
       }
-      else {
-        handleSlotProblem(persistence.verifySlot() === 'ok' ? 'storage-error' : 'conflict')
+      // 再次写入失败（如持续配额不足）：保留当前内存进度与失败提示，
+      // "重试保存"与"仅在此页继续"入口继续可用；只有槽位签名确实变化才算冲突
+      const verify = persistence.verifySlot()
+      if (verify === 'conflict' || verify === 'missing') {
+        handleSlotProblem(verify)
       }
     })
   }
@@ -362,7 +409,55 @@ export function useUnoGame() {
     actionError.value = null
   }
 
-  // ---- 页面可见性 ---------------------------------------------------------
+  // ---- 页面生命周期：可见性、卸载与历史缓存恢复 ---------------------------
+  /** pagehide（卸载 / 进入 bfcache）：释放控制权前先停调度、取消并作废在途请求。 */
+  function handlePageHide() {
+    aiTurn.cancelAll()
+  }
+
+  /**
+   * 从历史缓存（bfcache）返回：重新争取锁并读取最新存档，再恢复可操作状态；
+   * 未取得锁时显示只读状态。旧请求已在 pagehide 时作废，不会执行也不会触发兜底。
+   */
+  function handleRestored() {
+    void enqueue(async () => {
+      aiTurn.cancelAll()
+      const wasPlaying = status.value === 'playing'
+      const granted = await lock.request()
+      if (!granted) {
+        entrySave.value = persistence.readForDisplay()
+        status.value = webLocksSupported() ? 'readonly-locked' : 'no-lock-browser'
+        return
+      }
+      const load = persistence.loadInitial()
+      entrySave.value = load
+      if (wasPlaying) {
+        if (load.status === 'valid' && load.envelope) {
+          // 采用最新存档（可能已被其他标签页推进），从当前决策点继续
+          state.value = load.envelope.state
+          status.value = 'playing'
+          aiTurn.schedule()
+        }
+        else if (load.status === 'invalid') {
+          state.value = null
+          status.value = 'invalid-save'
+        }
+        else {
+          state.value = null
+          status.value = 'entry'
+        }
+        return
+      }
+      if (load.status === 'invalid') {
+        status.value = 'invalid-save'
+        return
+      }
+      if (status.value === 'readonly-locked' || status.value === 'no-lock-browser') {
+        status.value = 'entry'
+      }
+    })
+  }
+
   function handleVisibility() {
     if (document.visibilityState === 'hidden') {
       // 页面隐藏仅暂停推进，仍保留控制权
@@ -378,6 +473,11 @@ export function useUnoGame() {
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibility)
     }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pagehide', handlePageHide)
+    }
+    // bfcache 返回时由锁层通知；旧请求已在 pagehide 作废
+    lock.onRestored(handleRestored)
     void initialize()
   })
 
@@ -528,6 +628,8 @@ export function useUnoGame() {
     initialize,
     tryTakeControl,
     startNewGame,
+    currentSlotSignature,
+    slotNeedsConfirmation,
     continueGame,
     startTempGame,
     clearInvalidSaveAndStart,
@@ -537,6 +639,8 @@ export function useUnoGame() {
     exitToEntry,
     // 状态与派生
     state,
+    /** 浏览器存储是否可访问（不可用时入口明确提供不保存的临时对局）。 */
+    storageAvailable: persistence.storageAvailable,
     humanPlayer,
     opponents,
     topCard,

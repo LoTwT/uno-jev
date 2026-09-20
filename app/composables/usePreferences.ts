@@ -7,6 +7,7 @@
  */
 import { useColorMode, useLocalStorage, usePreferredReducedMotion } from '@vueuse/core'
 import { computed, onMounted, watch } from 'vue'
+import { storageWindow } from '~/utils/storage'
 
 export type ThemeIntent = 'auto' | 'light' | 'dark'
 export type ReducedMotionIntent = 'system' | 'reduce'
@@ -34,6 +35,8 @@ export function usePreferences() {
       write: value => JSON.stringify(normalizeTheme(value)),
     },
     listenToStorageChanges: true,
+    // 存储不可用时回退为内存默认值，初始化不访问被禁用的存储属性
+    window: storageWindow(),
   })
 
   const settings = useLocalStorage<GameSettings>(SETTINGS_STORAGE_KEY, { schemaVersion: 1, reducedMotion: 'system' }, {
@@ -55,6 +58,7 @@ export function usePreferences() {
     // 设置不因开始新局而清除；不自动写入默认值
     writeDefaults: false,
     listenToStorageChanges: true,
+    window: storageWindow(),
   })
 
   // useColorMode 只负责应用；持久化由 themeIntent 单独承担

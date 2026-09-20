@@ -4,6 +4,7 @@
  * 只读页不能发起 AI、修改存档、清除或开始新局；设置不受此锁限制。
  */
 import type { GameState } from '#shared/game'
+import { computed } from 'vue'
 
 const props = defineProps<{
   /** readonly-locked：对局在另一标签页进行；no-lock-browser：浏览器缺少 Web Locks。 */

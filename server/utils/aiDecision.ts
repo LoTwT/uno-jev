@@ -652,23 +652,12 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
   }
 
   // 7. 构造上游 payload 并调用（每决策最多一次上游请求）
+  // 超时覆盖响应头与正文读取：计时器在 finally 中统一清理
   const payload = buildUpstreamPayload(model, request.view, expected)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs)
-  let response: Response
-  try {
-    response = await fetchImpl(TYPESAFE_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    })
-  }
-  catch {
-    clearTimeout(timer)
+  /** 上游调用失败（连接或正文读取）：区分超时与网络 / 协议错误。 */
+  const upstreamFailure = (): AiDecisionHandlerResult => {
     if (controller.signal.aborted) {
       finishLog({ level: 'error', status: 504, code: 'ai_timeout', decisionId, requestedModel: model })
       return errorResult(504, 'ai_timeout', decisionId)
@@ -676,9 +665,51 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
     finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', decisionId, requestedModel: model })
     return errorResult(502, 'ai_upstream_error', decisionId)
   }
-  clearTimeout(timer)
+  try {
+    let response: Response
+    try {
+      response = await fetchImpl(TYPESAFE_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      })
+    }
+    catch {
+      return upstreamFailure()
+    }
 
-  // 8. 上游状态码映射
+    // 8. 上游状态码映射
+    const statusResult = mapUpstreamStatus(response, { decisionId, model, finishLog })
+    if (statusResult !== null) {
+      return statusResult
+    }
+
+    // 9. 读取并校验上游响应结构（正文读取仍在超时保护内）
+    let responseText: string
+    try {
+      responseText = await response.text()
+    }
+    catch {
+      // 正文读取失败：超时（已 abort）或连接中断
+      return upstreamFailure()
+    }
+    return handleUpstreamBody(responseText, { request, expectedById, decisionId, model, finishLog })
+  }
+  finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 上游状态码映射；成功（2xx）返回 null 交由正文处理。 */
+function mapUpstreamStatus(
+  response: Response,
+  ctx: { decisionId: string, model: string, finishLog: (entry: Omit<AiDecisionLogEntry, 'event' | 'durationMs'>) => void },
+): AiDecisionHandlerResult | null {
+  const { decisionId, model, finishLog } = ctx
   if (response.status === 429 || response.status === 529) {
     const retryAfterRaw = response.headers.get('retry-after')
     const retrySeconds = Number.parseInt(retryAfterRaw ?? '', 10)
@@ -697,9 +728,21 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
     finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', decisionId, requestedModel: model })
     return errorResult(502, 'ai_upstream_error', decisionId)
   }
+  return null
+}
 
-  // 9. 校验上游响应结构
-  const responseText = await response.text()
+/** 解析并校验上游响应正文；结构不合同时按 ai_invalid_response 处理（不透传上游原文）。 */
+function handleUpstreamBody(
+  responseText: string,
+  ctx: {
+    request: AiDecisionRequest
+    expectedById: Map<string, unknown>
+    decisionId: string
+    model: string
+    finishLog: (entry: Omit<AiDecisionLogEntry, 'event' | 'durationMs'>) => void
+  },
+): AiDecisionHandlerResult {
+  const { request, expectedById, decisionId, model, finishLog } = ctx
   let upstream: unknown
   try {
     upstream = JSON.parse(responseText)

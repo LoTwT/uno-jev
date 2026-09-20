@@ -50,7 +50,7 @@ pnpm lint           # eslint（@antfu/eslint-config）
 pnpm lint:fix       # 自动修复
 ```
 
-测试目录与验收编号对应：`tests/rules/`（R1..R7 规则引擎）、`tests/save/`（S1/S2 存档往返与校验）、`tests/session/`（S3/S4 保存时机、失败处理与多标签页锁、A3 客户端 AI 调度 mock 矩阵）、`tests/ai/`（A1/A2/A4 信息隔离、候选稳定性与确定性兜底）、`tests/server/`（A2/A3/A5 请求校验、上游错误映射与密钥隔离）。
+测试目录与验收编号对应：`tests/rules/`（R1..R7 规则引擎）、`tests/save/`（S1/S2 存档往返与校验）、`tests/session/`（S3/S4 保存时机、失败处理与多标签页锁、A3 客户端 AI 调度 mock 矩阵）、`tests/ai/`（A1/A2/A4 信息隔离、候选稳定性与确定性兜底）、`tests/server/`（A2/A3/A5 请求校验、上游错误映射与密钥隔离）、`tests/components/`（界面组件行为：出牌动作与 Jev 暂停提示）。
 
 真实 TypeSafe API 的联通、延迟与费用验证不在 v1 范围内；对战强度未实测，不构成任何胜率或响应时间承诺。
 

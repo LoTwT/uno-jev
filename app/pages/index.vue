@@ -13,6 +13,8 @@ const { themeIntent, setTheme, reducedMotion, setReducedMotion } = usePreference
 
 const rulesOpen = ref(false)
 const confirmNewGame = ref(false)
+/** 新局确认对话框中的动态提示（存档变化 / 未确认对局）。 */
+const confirmNotice = ref<string | null>(null)
 
 // ---- 真人选牌草稿（选色前不移牌；刷新放弃草稿） ----
 const selectedCardId = ref<string | null>(null)
@@ -28,10 +30,13 @@ const selectedCardView = computed(() =>
 const drawnCardView = computed(() =>
   session.handCards.value.find(card => card.isDrawn) ?? null,
 )
+/** 选中的牌是否属于 Wild 类（需要选色）。 */
 const needsColor = computed(() => {
   const card = selectedCardView.value?.card
   return card ? (card.kind === 'wild' || card.kind === 'wild-draw-four') : false
 })
+/** 当前是否尚未选色：Wild 类已选中且草稿颜色未定（选色后即可出牌）。 */
+const colorPending = computed(() => needsColor.value && wildColorDraft.value === null)
 const canDeclareUno = computed(() =>
   session.humanPlayer.value?.hand.length === 2 && selectedCardView.value !== null,
 )
@@ -131,25 +136,74 @@ const liveAnnouncement = computed(() => {
 
 const thinkingActorId = computed(() => session.aiTurn.inFlight.value?.actorId ?? null)
 
-function onStartNewGame() {
-  const game = state.value
-  // 替换进行中的唯一槽位前由产品界面确认
-  if (session.status.value === 'playing' && game && phaseKind.value !== 'finished') {
-    confirmNewGame.value = true
-    return
+/** 已知存在需要确认的进行中对局（内存或入口存档）。 */
+function hasKnownInProgressGame(): boolean {
+  if (session.status.value === 'playing' && state.value && phaseKind.value !== 'finished') {
+    return true
   }
-  // 入口处已有未结束存档时同样确认
-  if (session.entrySave.value.status === 'valid' && session.entrySave.value.envelope && session.entrySave.value.envelope.state.phase.kind !== 'finished') {
-    confirmNewGame.value = true
-    return
-  }
-  session.startNewGame()
+  const load = session.entrySave.value
+  return load.status === 'valid' && !!load.envelope && load.envelope.state.phase.kind !== 'finished'
 }
 
-function confirmStartNewGame() {
-  confirmNewGame.value = false
-  session.startNewGame()
+async function onStartNewGame() {
+  confirmNotice.value = null
+  // 替换进行中的唯一槽位前由产品界面确认
+  if (hasKnownInProgressGame()) {
+    confirmNewGame.value = true
+    return
+  }
+  // 会话层在取得锁后会重新读取最新槽位；若发现未确认的进行中对局（可能来自其他标签页），
+  // 返回 needs-confirmation 并要求用户按最新进度重新确认，不静默覆盖
+  const result = await session.startNewGame()
+  if (result === 'needs-confirmation') {
+    confirmNotice.value = '检测到尚未确认的对局存档（可能来自其他标签页），请确认后覆盖。'
+    confirmNewGame.value = true
+  }
 }
+
+async function confirmStartNewGame() {
+  // 用户在对话框中确认的是当前展示的版本；写入前会话层会再次核对槽位签名
+  const signature = session.currentSlotSignature()
+  confirmNewGame.value = false
+  const result = await session.startNewGame(signature)
+  if (result === 'needs-confirmation') {
+    confirmNotice.value = '存档在确认后发生了变化，请按最新进度重新确认。'
+    confirmNewGame.value = true
+  }
+}
+
+function cancelNewGameConfirm() {
+  confirmNewGame.value = false
+  confirmNotice.value = null
+}
+
+async function onRestartGame() {
+  confirmNotice.value = null
+  const result = await session.startNewGame()
+  if (result === 'needs-confirmation') {
+    confirmNotice.value = '检测到尚未确认的对局存档（可能来自其他标签页），请确认后覆盖。'
+    confirmNewGame.value = true
+  }
+}
+
+/** 确认对话框展示的"将被覆盖的存档"摘要（取锁后刷新过的最新信息）。 */
+const overwriteSummary = computed(() => {
+  if (session.status.value === 'playing' && state.value && phaseKind.value !== 'finished') {
+    return `本页进行中的对局（第 ${state.value.revision} 步，手牌 ${session.humanPlayer.value?.hand.length ?? 0} 张）`
+  }
+  const load = session.entrySave.value
+  if (load.status === 'invalid') {
+    return '无法读取的存档'
+  }
+  if (load.status === 'valid' && load.envelope) {
+    const saved = load.envelope.state
+    if (saved.phase.kind === 'finished') {
+      return null
+    }
+    return `已保存的对局（第 ${saved.revision} 步，你的手牌 ${saved.players[0]?.hand.length ?? 0} 张）`
+  }
+  return null
+})
 
 useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
 </script>
@@ -211,8 +265,10 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
           v-else-if="session.status.value === 'entry'"
           :has-valid-save="session.entrySave.value.status === 'valid'"
           :saved-state="session.entrySave.value.status === 'valid' ? session.entrySave.value.envelope?.state ?? null : null"
+          :storage-unavailable="!session.storageAvailable.value"
           @start="onStartNewGame"
           @continue="session.continueGame()"
+          @start-temp="session.startTempGame()"
           @show-rules="rulesOpen = true"
         />
 
@@ -275,6 +331,11 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
             />
           </div>
 
+          <!-- Jev 暂停：明确状态与重试入口（只恢复后续决策） -->
+          <div v-if="session.aiTurn.jevPaused.value" class="flex justify-center">
+            <AiPauseNotice @retry="session.aiTurn.resumeJev()" />
+          </div>
+
           <!-- 对手区 -->
           <div class="grid grid-cols-3 gap-2">
             <OpponentPanel
@@ -298,7 +359,7 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
           <FinishedOverlay
             v-if="phaseKind === 'finished'"
             :state="state"
-            @restart="session.startNewGame()"
+            @restart="onRestartGame()"
             @exit="session.exitToEntry()"
           />
 
@@ -333,7 +394,7 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
               :active="isHumanTurn"
               :selected-card="selectedCardView?.card ?? null"
               :can-declare-uno="canDeclareUno"
-              :needs-color="needsColor"
+              :color-pending="colorPending"
               :after-draw="humanAfterDraw"
               :drawn-card="drawnCardView?.card ?? null"
               :phase-hint="turnHint"
@@ -392,20 +453,30 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
           role="dialog"
           aria-modal="true"
           aria-label="确认新开一局"
-          @click.self="confirmNewGame = false"
+          @click.self="cancelNewGameConfirm"
         >
           <div class="w-full max-w-sm rounded-2xl border border-[var(--border-default)] bg-[var(--surface-elevated)] p-5">
             <h2 class="font-bold mb-2">
               新开一局将替换当前存档
             </h2>
-            <p class="text-sm text-[var(--text-secondary)] mb-4">
+            <p class="text-sm text-[var(--text-secondary)] mb-2">
               浏览器只保留一个对局槽位。开始新局后，现有对局进度将被覆盖，此操作不可撤销。
+            </p>
+            <p
+              v-if="confirmNotice"
+              class="text-sm rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-fg)] p-2 mb-2"
+              role="alert"
+            >
+              {{ confirmNotice }}
+            </p>
+            <p v-if="overwriteSummary" class="text-xs text-[var(--text-muted)] mb-3">
+              当前存档：{{ overwriteSummary }}
             </p>
             <div class="flex gap-2 justify-end">
               <button
                 type="button"
                 class="min-h-11 px-4 rounded-lg border-2 border-[var(--border-strong)] font-medium hover:bg-[var(--surface-subtle)]"
-                @click="confirmNewGame = false"
+                @click="cancelNewGameConfirm"
               >
                 取消
               </button>

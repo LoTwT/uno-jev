@@ -5,6 +5,7 @@
  * 按钮禁用时提供原因（无障碍描述）。
  */
 import type { Card } from '#shared/game'
+import { computed } from 'vue'
 
 const props = defineProps<{
   active: boolean
@@ -12,8 +13,8 @@ const props = defineProps<{
   selectedCard: Card | null
   /** 选中后是否剩 1 张（可宣告 UNO）。 */
   canDeclareUno: boolean
-  /** 选中的是 Wild 类（需先选色）。 */
-  needsColor: boolean
+  /** 当前是否尚未选色（Wild 类已选中但草稿颜色未定）；已选色后为 false。 */
+  colorPending: boolean
   /** after-draw 阶段。 */
   afterDraw: boolean
   /** after-draw 的出牌按钮文案。 */
@@ -36,15 +37,12 @@ function playDisabledReason(declareUno: boolean): string | null {
     if (!props.drawnCard) {
       return '没有刚抽到的牌'
     }
-    if (declareUno && !props.canDeclareUno) {
-      return '只有出到剩 1 张时才能宣告 UNO'
-    }
-    return null
   }
-  if (!props.selectedCard) {
+  else if (!props.selectedCard) {
     return '先在手牌中选择一张牌'
   }
-  if (props.needsColor) {
+  // 选色是出牌前的草稿：仅在尚未选色时禁用（普通回合与抽后阶段一致）
+  if (props.colorPending) {
     return '先为万能牌选择颜色'
   }
   if (declareUno && !props.canDeclareUno) {

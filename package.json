@@ -29,6 +29,7 @@
   "devDependencies": {
     "@antfu/eslint-config": "^9.5.1",
     "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^6.0.9",
     "@vue/test-utils": "^2.5.1",
     "eslint": "^10.11.0",
     "happy-dom": "^20.14.5",

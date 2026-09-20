@@ -20,6 +20,8 @@ export interface GameLock {
   request: () => Promise<boolean>
   /** 释放锁；幂等。 */
   release: () => void
+  /** 注册历史缓存（bfcache）恢复回调（pageshow persisted）；返回取消注册函数。 */
+  onRestored: (callback: () => void) => () => void
 }
 
 export function webLocksSupported(): boolean {
@@ -80,12 +82,31 @@ export function useGameLock(): GameLock {
     })
   }
 
+  const restoreCallbacks = new Set<() => void>()
+
+  /** 注册 bfcache 恢复回调；返回取消注册函数。 */
+  function onRestored(callback: () => void): () => void {
+    restoreCallbacks.add(callback)
+    return () => restoreCallbacks.delete(callback)
+  }
+
   if (typeof window !== 'undefined') {
-    // 释放控制权：页面卸载 / 返回入口由调用方显式触发；历史缓存返回后需重新争取
+    // 释放控制权：pagehide / 组件销毁时释放；历史缓存返回（pageshow persisted）时通知会话层重新争取
     const onPageHide = () => release()
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) {
+        return
+      }
+      for (const callback of [...restoreCallbacks]) {
+        callback()
+      }
+    }
     window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow as EventListener)
     onBeforeUnmount(() => {
       window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow as EventListener)
+      restoreCallbacks.clear()
       release()
     })
   }
@@ -95,5 +116,6 @@ export function useGameLock(): GameLock {
     held: readonly(held),
     request,
     release,
+    onRestored,
   }
 }
