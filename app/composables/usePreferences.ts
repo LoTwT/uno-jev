@@ -18,6 +18,7 @@ export const SETTINGS_STORAGE_KEY = 'unojev:settings'
 export interface GameSettings {
   schemaVersion: 1
   reducedMotion: ReducedMotionIntent
+  revealHands: boolean
 }
 
 const THEME_VALUES: ThemeIntent[] = ['auto', 'light', 'dark']
@@ -39,7 +40,7 @@ export function usePreferences() {
     window: storageWindow(),
   })
 
-  const settings = useLocalStorage<GameSettings>(SETTINGS_STORAGE_KEY, { schemaVersion: 1, reducedMotion: 'system' }, {
+  const settings = useLocalStorage<GameSettings>(SETTINGS_STORAGE_KEY, { schemaVersion: 1, reducedMotion: 'system', revealHands: false }, {
     serializer: {
       read: (raw) => {
         try {
@@ -47,10 +48,10 @@ export function usePreferences() {
           const reducedMotion = MOTION_VALUES.includes(parsed?.reducedMotion as ReducedMotionIntent)
             ? parsed!.reducedMotion as ReducedMotionIntent
             : 'system'
-          return { schemaVersion: 1, reducedMotion }
+          return { schemaVersion: 1, reducedMotion, revealHands: parsed?.revealHands === true }
         }
         catch {
-          return { schemaVersion: 1, reducedMotion: 'system' }
+          return { schemaVersion: 1, reducedMotion: 'system', revealHands: false }
         }
       },
       write: value => JSON.stringify(value),
@@ -71,6 +72,7 @@ export function usePreferences() {
   })
 
   const systemReducedMotion = usePreferredReducedMotion()
+  const revealHands = computed(() => settings.value.revealHands)
   const reducedMotion = computed(() => {
     if (settings.value.reducedMotion === 'reduce') {
       return true
@@ -83,7 +85,11 @@ export function usePreferences() {
   }
 
   function setReducedMotion(intent: ReducedMotionIntent) {
-    settings.value = { schemaVersion: 1, reducedMotion: intent }
+    settings.value = { ...settings.value, reducedMotion: intent }
+  }
+
+  function setRevealHands(enabled: boolean) {
+    settings.value = { ...settings.value, revealHands: enabled }
   }
 
   return {
@@ -92,5 +98,7 @@ export function usePreferences() {
     settings,
     setReducedMotion,
     reducedMotion,
+    revealHands,
+    setRevealHands,
   }
 }

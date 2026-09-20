@@ -9,7 +9,7 @@ import { useUnoGame } from '~/composables/useUnoGame'
 import { cardLabel, eventDescription } from '~/utils/display'
 
 const session = useUnoGame()
-const { themeIntent, setTheme, reducedMotion, setReducedMotion } = usePreferences()
+const { themeIntent, setTheme, reducedMotion, setReducedMotion, revealHands, setRevealHands } = usePreferences()
 
 const rulesOpen = ref(false)
 const confirmNewGame = ref(false)
@@ -339,7 +339,7 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
         />
 
         <!-- 对局进行中 / 已结束 -->
-        <div v-else-if="session.status.value === 'playing' && state" class="w-full max-w-4xl flex flex-col gap-3">
+        <div v-else-if="session.status.value === 'playing' && state" class="w-full max-w-5xl flex flex-col gap-3">
           <!-- 保存状态（失败时显著提示） -->
           <div v-if="session.persistence.saveHealth.value !== 'ok'" class="flex justify-center">
             <SaveStatusBar
@@ -354,85 +354,75 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
             <AiPauseNotice @retry="session.aiTurn.resumeJev()" />
           </div>
 
-          <!-- 对手区 -->
-          <div class="grid grid-cols-3 gap-2">
-            <OpponentPanel
-              v-for="opponent in session.opponents.value"
-              :key="opponent.player.id"
-              :opponent="opponent"
-              :is-current="state.currentPlayerId === opponent.player.id && phaseKind !== 'finished'"
-              :thinking="thinkingActorId === opponent.player.id"
-            />
-          </div>
-
-          <!-- 牌桌中心 -->
-          <TableCenter
-            :top-card="session.topCard.value"
-            :current-color="state.currentColor"
-            :direction="state.direction"
-            :draw-pile-count="state.drawPile.length"
-          />
-
-          <!-- 结束页覆盖中心操作区 -->
-          <FinishedOverlay
-            v-if="phaseKind === 'finished'"
+          <GameTable
             :state="state"
-            @restart="onRestartGame()"
-            @exit="session.exitToEntry()"
-          />
+            :opponents="session.opponents.value"
+            :top-card="session.topCard.value"
+            :thinking-actor-id="thinkingActorId"
+            :reveal-hands="revealHands"
+            @set-reveal-hands="setRevealHands"
+          >
+            <!-- 结束页覆盖中心操作区 -->
+            <FinishedOverlay
+              v-if="phaseKind === 'finished'"
+              :state="state"
+              @restart="onRestartGame()"
+              @exit="session.exitToEntry()"
+            />
 
-          <template v-else>
-            <!-- 开局选色（真人） -->
-            <div v-if="humanIsChoosingOpening" class="max-w-md w-full mx-auto">
-              <ColorPicker purpose="opening" @choose="onOpeningColor" />
-            </div>
+            <template v-else>
+              <!-- 开局选色（真人） -->
+              <div v-if="humanIsChoosingOpening" class="max-w-md w-full mx-auto">
+                <ColorPicker purpose="opening" @choose="onOpeningColor" />
+              </div>
 
-            <!-- Wild 选色草稿 -->
-            <div v-else-if="needsColor && isHumanTurn" class="max-w-md w-full mx-auto">
-              <ColorPicker
-                purpose="play-wild"
-                @choose="onWildColorDraft"
-                @cancel="cancelWildDraft"
+              <!-- Wild 选色草稿 -->
+              <div v-else-if="needsColor && isHumanTurn" class="max-w-md w-full mx-auto">
+                <ColorPicker
+                  purpose="play-wild"
+                  @choose="onWildColorDraft"
+                  @cancel="cancelWildDraft"
+                />
+                <p v-if="wildColorDraft" class="text-xs text-[var(--text-secondary)] mt-1 text-center">
+                  已选 {{ wildColorDraft === 'red' ? '红' : wildColorDraft === 'yellow' ? '黄' : wildColorDraft === 'green' ? '绿' : '蓝' }} 色，点击"出牌"确认（选色前不移牌）
+                </p>
+              </div>
+
+              <!-- 真人手牌 -->
+              <PlayerHand
+                :cards="session.handCards.value"
+                :active="isHumanTurn"
+                :selected-id="selectedCardId"
+                @select="onSelectCard"
               />
-              <p v-if="wildColorDraft" class="text-xs text-[var(--text-secondary)] mt-1 text-center">
-                已选 {{ wildColorDraft === 'red' ? '红' : wildColorDraft === 'yellow' ? '黄' : wildColorDraft === 'green' ? '绿' : '蓝' }} 色，点击"出牌"确认（选色前不移牌）
+
+              <!-- 回合操作 -->
+              <TurnActions
+                :active="isHumanTurn"
+                :selected-card="selectedCardView?.card ?? null"
+                :can-declare-uno="canDeclareUno"
+                :color-pending="colorPending"
+                :after-draw="humanAfterDraw"
+                :drawn-card="drawnCardView?.card ?? null"
+                :phase-hint="turnHint"
+                @play="onPlay"
+                @draw="onDraw"
+                @keep-drawn="onKeepDrawn"
+              />
+
+              <!-- 动作错误提示 -->
+              <p
+                v-if="session.actionError.value"
+                class="text-sm text-[var(--status-danger-fg)] text-center"
+                role="alert"
+              >
+                {{ session.actionError.value }}
+                <button type="button" class="underline ml-2" @click="session.dismissActionError()">
+                  知道了
+                </button>
               </p>
-            </div>
-
-            <!-- 真人手牌 -->
-            <PlayerHand
-              :cards="session.handCards.value"
-              :active="isHumanTurn"
-              :selected-id="selectedCardId"
-              @select="onSelectCard"
-            />
-
-            <!-- 回合操作 -->
-            <TurnActions
-              :active="isHumanTurn"
-              :selected-card="selectedCardView?.card ?? null"
-              :can-declare-uno="canDeclareUno"
-              :color-pending="colorPending"
-              :after-draw="humanAfterDraw"
-              :drawn-card="drawnCardView?.card ?? null"
-              :phase-hint="turnHint"
-              @play="onPlay"
-              @draw="onDraw"
-              @keep-drawn="onKeepDrawn"
-            />
-
-            <!-- 动作错误提示 -->
-            <p
-              v-if="session.actionError.value"
-              class="text-sm text-[var(--status-danger-fg)] text-center"
-              role="alert"
-            >
-              {{ session.actionError.value }}
-              <button type="button" class="underline ml-2" @click="session.dismissActionError()">
-                知道了
-              </button>
-            </p>
-          </template>
+            </template>
+          </GameTable>
 
           <!-- 日志与返回入口 -->
           <div class="flex flex-col sm:flex-row gap-3 items-start">

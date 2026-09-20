@@ -12,7 +12,7 @@ const props = withDefaults(defineProps<{
   faceDown?: boolean
   /** Wild 已选定的颜色提示（顶牌展示当前颜色）。 */
   effectiveColor?: boolean
-  size?: 'md' | 'lg'
+  size?: 'sm' | 'md' | 'lg'
 }>(), {
   faceDown: false,
   effectiveColor: false,
@@ -31,8 +31,16 @@ const colorClass = computed(() => {
 
 const isWild = computed(() => props.card.kind === 'wild' || props.card.kind === 'wild-draw-four')
 
-const sizeClass = computed(() => (props.size === 'lg' ? 'w-20 h-28 sm:w-24 sm:h-36' : 'w-[4.5rem] h-[6.5rem]'))
-const symbolSize = computed(() => (props.size === 'lg' ? 'text-4xl sm:text-5xl' : 'text-3xl'))
+const sizeClass = computed(() => ({
+  sm: 'w-8 h-12 sm:w-10 sm:h-14',
+  md: 'w-[4.5rem] h-[6.5rem]',
+  lg: 'w-12 h-[4.5rem] sm:w-20 sm:h-28',
+}[props.size]))
+const symbolSize = computed(() => ({
+  sm: 'text-base sm:text-xl mt-1',
+  md: 'text-3xl mt-4',
+  lg: 'text-2xl sm:text-4xl mt-2 sm:mt-4',
+}[props.size]))
 </script>
 
 <template>
@@ -43,19 +51,19 @@ const symbolSize = computed(() => (props.size === 'lg' ? 'text-4xl sm:text-5xl' 
   >
     <!-- Wild：四色条表示可选任意颜色 -->
     <template v-if="isWild && !faceDown">
-      <div class="absolute top-2 inset-x-2 flex gap-0.5 rounded-sm overflow-hidden" aria-hidden="true">
-        <div class="h-2 flex-1" style="background: var(--game-red);" />
-        <div class="h-2 flex-1" style="background: var(--game-yellow);" />
-        <div class="h-2 flex-1" style="background: var(--game-green);" />
-        <div class="h-2 flex-1" style="background: var(--game-blue);" />
+      <div class="absolute flex gap-0.5 rounded-sm overflow-hidden" :class="size === 'sm' ? 'top-1 inset-x-1 h-1' : 'top-2 inset-x-2 h-2'" aria-hidden="true">
+        <div class="flex-1" style="background: var(--game-red);" />
+        <div class="flex-1" style="background: var(--game-yellow);" />
+        <div class="flex-1" style="background: var(--game-green);" />
+        <div class="flex-1" style="background: var(--game-blue);" />
       </div>
     </template>
 
     <template v-if="!faceDown">
-      <div class="font-bold leading-none mt-4" :class="symbolSize" aria-hidden="true">
+      <div class="font-bold leading-none" :class="symbolSize" aria-hidden="true">
         {{ cardSymbol(card) }}
       </div>
-      <div class="text-xs font-semibold mt-2 tracking-wide">
+      <div class="font-semibold tracking-wide" :class="size === 'sm' ? 'text-[8px] sm:text-[10px] mt-1' : 'text-[10px] sm:text-xs mt-2'">
         {{ card.color ? COLOR_NAMES[card.color] : (card.kind === 'wild' ? '万能' : '万能+4') }}
       </div>
     </template>
