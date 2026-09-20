@@ -300,14 +300,27 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
           <p class="text-sm text-[var(--text-secondary)] mb-4">
             检测到本地存档与本页状态不一致（{{ session.slotProblemKind.value === 'missing' ? '槽位被删除' : '内容被外部改写' }}）。
             本页已停止写入并取消未完成的 AI 请求；请重新加载最新存档。
+            <template v-if="state">
+              本页还有未保存的进度（第 {{ state.revision }} 步），也可以保留它仅在此页继续。
+            </template>
           </p>
-          <button
-            type="button"
-            class="min-h-11 px-5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-contrast)] font-semibold hover:bg-[var(--accent-primary-hover)]"
-            @click="session.reloadFromSlot()"
-          >
-            重新加载最新存档
-          </button>
+          <div class="flex gap-2 flex-wrap">
+            <button
+              type="button"
+              class="min-h-11 px-5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-contrast)] font-semibold hover:bg-[var(--accent-primary-hover)]"
+              @click="session.reloadFromSlot()"
+            >
+              重新加载最新存档
+            </button>
+            <button
+              v-if="state"
+              type="button"
+              class="min-h-11 px-5 rounded-lg border-2 border-[var(--border-strong)] font-semibold hover:bg-[var(--surface-subtle)]"
+              @click="session.continueInMemoryOnly()"
+            >
+              保留本页进度，仅在此页继续
+            </button>
+          </div>
         </div>
 
         <!-- 只读视图 -->

@@ -2,12 +2,15 @@ import type { GameState } from '#shared/game'
 // @vitest-environment happy-dom
 // S3：保存时机（动作后立即保存）、写入失败处理（保留旧槽位 / 重试 / 临时模式）、
 // 新局不清设置、坏存档加载保留原槽位
+// 第二轮审查问题 2 回归：坏档未经确认不得被新局覆盖；清除前重新取锁并重读槽位，
+// 内容变化时更新界面并要求重新确认（"未确认"与"没有有效签名"必须区分）。
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent, h } from 'vue'
-import { loadSaveEnvelope } from '#shared/game'
+import { loadSaveEnvelope, serializeSaveEnvelope } from '#shared/game'
 import { SAVE_KEY, useGamePersistence } from '~/composables/useGamePersistence'
 import { useUnoGame } from '~/composables/useUnoGame'
+import { cardOf, makeGame } from '../rules/helpers'
 
 /** 立即授予的 Web Locks mock（S4 的锁细节由 lock.test.ts 覆盖）。 */
 function installGrantingLocks() {
@@ -67,6 +70,34 @@ async function settle() {
 
 function readSlot(): string | null {
   return window.localStorage.getItem(SAVE_KEY)
+}
+
+const WRITER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const OTHER_WRITER = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+
+/** 进行中的有效对局（p0 行动）。 */
+function validInProgressState(): GameState {
+  return makeGame({
+    dealerId: 'p3',
+    openingId: cardOf({ kind: 'number', color: 'red', value: 5 }),
+    hands: {
+      p0: ['red-1-2', 'blue-9-1', 'green-9-1', 'yellow-9-1', 'blue-8-1', 'green-8-1', 'wild-4'],
+      p1: ['blue-5-2', 'red-3-2', 'green-skip-2', 'yellow-reverse-1', 'wild-1', 'wild-draw-four-1', 'blue-9-2'],
+      p2: ['green-1-2', 'green-2-2', 'green-3-2', 'green-4-2', 'green-5-2', 'green-6-2', 'green-7-2'],
+      p3: ['yellow-1-2', 'yellow-2-2', 'yellow-3-2', 'yellow-4-2', 'yellow-5-2', 'yellow-6-2', 'yellow-7-2'],
+    },
+  })
+}
+
+function writeEnvelope(state: GameState, writerId = WRITER): string {
+  const raw = serializeSaveEnvelope({
+    schemaVersion: 1,
+    savedAt: '2026-09-20T00:00:00.000Z',
+    writerId,
+    state,
+  })
+  window.localStorage.setItem(SAVE_KEY, raw)
+  return raw
 }
 
 beforeEach(() => {
@@ -348,6 +379,106 @@ describe('坏存档加载（S2 会话侧）', () => {
     const result = persistence.loadInitial()
     expect(result.status).toBe('invalid')
     expect(window.localStorage.getItem(SAVE_KEY)).toBe(bad)
+    wrapper.unmount()
+  })
+})
+
+describe('坏档确认保护（第二轮审查问题 2）', () => {
+  it('入口无存档、点击新局前槽位变成坏档：进入"存档无法读取"，不覆盖原始内容', async () => {
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().status.value).toBe('entry')
+    expect(session().entrySave.value.status).toBe('absent')
+
+    // 点击新局前槽位被写成坏 JSON（其他页面 / 扩展写入）
+    window.localStorage.setItem(SAVE_KEY, '{corrupted')
+
+    const result = await session().startNewGame()
+    expect(result, '不得开始新局').toBe('blocked')
+    expect(session().status.value, '新发现的坏档进入"存档无法读取"').toBe('invalid-save')
+    expect(session().state.value).toBeNull()
+    expect(readSlot(), '坏档不得被新局覆盖').toBe('{corrupted')
+
+    // 用户明确选择清除并新开后才可以替换
+    session().clearInvalidSaveAndStart()
+    await settle()
+    expect(session().status.value).toBe('playing')
+    expect(loadSaveEnvelope(readSlot()!).ok).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('清除坏档前内容被换成另一份坏档：更新界面并要求重新确认，不清除', async () => {
+    window.localStorage.setItem(SAVE_KEY, '{corrupted')
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().status.value).toBe('invalid-save')
+
+    // 另一页面把坏档换成另一份坏档
+    const replaced = JSON.stringify({ schemaVersion: 2, savedAt: 'x', writerId: OTHER_WRITER, state: {} })
+    window.localStorage.setItem(SAVE_KEY, replaced)
+
+    session().clearInvalidSaveAndStart()
+    await settle()
+    expect(session().status.value, '内容变化后要求重新确认').toBe('invalid-save')
+    expect(readSlot(), '不得清除其他页面写入的内容').toBe(replaced)
+    expect(session().entrySave.value.status).toBe('invalid')
+    expect(session().entrySave.value.message).toContain('2')
+
+    // 用户按最新内容再次确认后才清除并新开
+    session().clearInvalidSaveAndStart()
+    await settle()
+    expect(session().status.value).toBe('playing')
+    expect(loadSaveEnvelope(readSlot()!).ok).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('清除坏档前槽位变成有效存档：保留新存档并回到入口，仍需确认覆盖', async () => {
+    window.localStorage.setItem(SAVE_KEY, '{corrupted')
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().status.value).toBe('invalid-save')
+
+    // 另一页面写入进行中的有效对局
+    const replaced = writeEnvelope(validInProgressState(), OTHER_WRITER)
+    expect(loadSaveEnvelope(replaced).ok, '构造的对局存档应有效').toBe(true)
+
+    session().clearInvalidSaveAndStart()
+    await settle()
+    expect(session().status.value, '保留新存档并回到入口').toBe('entry')
+    expect(readSlot()).toBe(replaced)
+    expect(session().entrySave.value.status).toBe('valid')
+    expect(session().slotNeedsConfirmation(), '进行中的新存档仍需确认').toBe(true)
+    wrapper.unmount()
+  })
+
+  it('有效进行中存档的版本确认保护仍然生效（回归保护）', async () => {
+    writeEnvelope(validInProgressState(), OTHER_WRITER)
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().status.value).toBe('entry')
+
+    // 未携带确认：不覆盖
+    const slotBefore = readSlot()
+    expect(await session().startNewGame()).toBe('needs-confirmation')
+    expect(readSlot()).toBe(slotBefore)
+
+    // 按当前签名确认后才可覆盖
+    expect(await session().startNewGame(session().currentSlotSignature())).toBe('started')
+    expect(readSlot()).not.toBe(slotBefore)
+    wrapper.unmount()
+  })
+
+  it('已结束的对局无需确认即可新开（回归保护）', async () => {
+    const finished = validInProgressState()
+    finished.phase = { kind: 'finished', result: { reason: 'blocked', winnerId: null } }
+    const raw = writeEnvelope(finished, OTHER_WRITER)
+    expect(loadSaveEnvelope(raw).ok, '构造的已结束存档应有效').toBe(true)
+
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().slotNeedsConfirmation()).toBe(false)
+    expect(await session().startNewGame()).toBe('started')
+    expect(session().status.value).toBe('playing')
     wrapper.unmount()
   })
 })

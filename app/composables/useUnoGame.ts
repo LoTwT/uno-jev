@@ -72,12 +72,20 @@ export function useUnoGame() {
   const persistence = useGamePersistence()
   const lock = useGameLock()
 
-  /** 是否允许自动推进 AI（页面可见、持锁 / 临时模式、存档未失败）。 */
+  /**
+   * 本页对局不再读写共享槽位：临时对局（无 Web Locks / 存储不可用），
+   * 或用户已明确选择"仅在此页继续"。这类会话的推进不依赖共享槽位的控制权。
+   */
+  function isMemoryOnlySession(): boolean {
+    return controlMode.value === 'temp' || persistence.saveHealth.value === 'memory-only'
+  }
+
+  /** 是否允许自动推进 AI（页面可见、持锁 / 内存模式、存档未失败）。 */
   function canAdvance(): boolean {
     if (status.value !== 'playing') {
       return false
     }
-    if (controlMode.value === 'locked' && !lock.held.value) {
+    if (!isMemoryOnlySession() && !lock.held.value) {
       return false
     }
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
@@ -108,7 +116,7 @@ export function useUnoGame() {
 
   // ---- 保存与冲突 ---------------------------------------------------------
   function persistCurrent(): boolean {
-    if (controlMode.value === 'temp' || persistence.saveHealth.value === 'memory-only') {
+    if (isMemoryOnlySession()) {
       return true
     }
     if (!lock.held.value) {
@@ -135,7 +143,8 @@ export function useUnoGame() {
     if (status.value !== 'playing' || state.value === null) {
       return false
     }
-    if (controlMode.value === 'locked' && !lock.held.value) {
+    // 内存模式（临时对局 / 仅此页继续）不写共享槽位，不需要控制权
+    if (!isMemoryOnlySession() && !lock.held.value) {
       return false
     }
     // 持锁期间比较持久化槽位与最后成功读取 / 保存的签名；
@@ -172,6 +181,22 @@ export function useUnoGame() {
   }
 
   // ---- 会话初始化 ---------------------------------------------------------
+  /**
+   * 最近一次展示"存档无法读取"时的原始槽位内容。
+   * 用户确认清除前据此核对内容是否已被其他页面替换（坏档没有可用于比较的签名）。
+   */
+  const invalidSlotRaw = shallowRef<string | null>(null)
+
+  /**
+   * 进入"存档无法读取"流程：保留原始槽位内容，记录展示给用户的原始文本，
+   * 只有用户明确选择"清除并新开一局"才会替换槽位。
+   */
+  function enterInvalidSave(load: InitialLoad) {
+    entrySave.value = load
+    invalidSlotRaw.value = persistence.readRawSlot()
+    status.value = 'invalid-save'
+  }
+
   async function initialize() {
     if (status.value !== 'boot') {
       return
@@ -189,11 +214,12 @@ export function useUnoGame() {
       watchForControlRelease()
       return
     }
-    entrySave.value = persistence.loadInitial()
-    if (entrySave.value.status === 'invalid') {
-      status.value = 'invalid-save'
+    const load = persistence.loadInitial()
+    if (load.status === 'invalid') {
+      enterInvalidSave(load)
       return
     }
+    entrySave.value = load
     status.value = 'entry'
   }
 
@@ -222,8 +248,14 @@ export function useUnoGame() {
         storageListener = null
       }
       aiTurn.cancelAll()
-      entrySave.value = persistence.loadInitial()
-      status.value = entrySave.value.status === 'invalid' ? 'invalid-save' : 'entry'
+      const load = persistence.loadInitial()
+      if (load.status === 'invalid') {
+        enterInvalidSave(load)
+      }
+      else {
+        entrySave.value = load
+        status.value = 'entry'
+      }
     }
     else {
       entrySave.value = persistence.readForDisplay()
@@ -263,6 +295,21 @@ export function useUnoGame() {
     return persistence.lastKnownSignature.value
   }
 
+  /**
+   * 用户是否已明确确认当前槽位版本。
+   *
+   * 省略参数表示"本次调用没有携带确认"；显式传入的签名必须与当前槽位一致才算确认。
+   * 槽位没有有效签名（无法读取）时任何签名都不构成确认——不能以 null === null
+   * 认定用户确认过，否则新发现的坏档会被静默覆盖。
+   */
+  function isConfirmedSlotVersion(confirmedSignature?: SaveSignature | null): boolean {
+    if (confirmedSignature === undefined || confirmedSignature === null) {
+      return false
+    }
+    const current = currentSlotSignature()
+    return current !== null && sameSignature(current, confirmedSignature)
+  }
+
   /** 槽位是否存在需要用户确认才可覆盖的内容（进行中的对局或无法读取的存档）。 */
   function slotNeedsConfirmation(): boolean {
     const load = entrySave.value
@@ -280,8 +327,14 @@ export function useUnoGame() {
       if (!(await ensureControl())) {
         return 'blocked'
       }
+      // 取锁后新发现的坏档：保留原始内容并进入"存档无法读取"流程，
+      // 只有用户在界面上明确选择"清除并新开一局"才可替换槽位
+      if (entrySave.value.status === 'invalid') {
+        enterInvalidSave(entrySave.value)
+        return 'blocked'
+      }
       // 写入前检查槽位是否仍对应用户确认过的版本；变化时更新界面并要求重新确认
-      if (slotNeedsConfirmation() && !sameSignature(currentSlotSignature(), confirmedSignature ?? null)) {
+      if (slotNeedsConfirmation() && !isConfirmedSlotVersion(confirmedSignature)) {
         return 'needs-confirmation'
       }
       aiTurn.cancelAll()
@@ -332,11 +385,33 @@ export function useUnoGame() {
     })
   }
 
-  /** 存档无法读取时：用户确认清除并新开一局。 */
+  /**
+   * 存档无法读取时：用户确认清除并新开一局。
+   * 清除前重新取得控制权并重读槽位：内容已被其他页面替换（换成新存档或另一份坏档）时
+   * 更新界面并要求重新确认，避免清掉其他页面在此期间写入的进度。
+   */
   function clearInvalidSaveAndStart() {
-    enqueue(() => {
-      persistence.clearSlot()
+    enqueue(async () => {
+      if (!(await ensureControl())) {
+        return
+      }
+      const load = entrySave.value
+      if (load.status === 'valid') {
+        // 槽位已是可读存档：保留它，回到入口由用户按最新内容重新选择
+        status.value = 'entry'
+        return
+      }
+      if (load.status === 'invalid' && persistence.readRawSlot() !== invalidSlotRaw.value) {
+        // 坏档内容已被其他页面改写：更新提示并要求重新确认
+        enterInvalidSave(load)
+        return
+      }
+      // 内容仍是用户确认过的坏档（或已被外部清除）：清除后新开
+      if (load.status === 'invalid') {
+        persistence.clearSlot()
+      }
       entrySave.value = { status: 'absent' }
+      invalidSlotRaw.value = null
       startNewGame()
     })
   }
@@ -347,15 +422,18 @@ export function useUnoGame() {
         return
       }
       aiTurn.cancelAll()
-      entrySave.value = persistence.loadInitial()
-      if (entrySave.value.status === 'valid' && entrySave.value.envelope) {
-        state.value = entrySave.value.envelope.state
+      const load = persistence.loadInitial()
+      entrySave.value = load
+      if (load.status === 'valid' && load.envelope) {
+        state.value = load.envelope.state
         status.value = 'playing'
         slotProblemKind.value = null
+        // 内存已与槽位快照一致：清除此前的写入失败标记，避免恢复后无谓地暂停推进
+        persistence.clearWriteFailure()
         aiTurn.schedule()
       }
-      else if (entrySave.value.status === 'invalid') {
-        status.value = 'invalid-save'
+      else if (load.status === 'invalid') {
+        enterInvalidSave(load)
       }
       else {
         // 槽位被外部删除且无内容可载入：回到入口
@@ -366,9 +444,18 @@ export function useUnoGame() {
   }
 
   function retrySave() {
-    enqueue(() => {
+    enqueue(async () => {
       if (state.value === null) {
         return
+      }
+      // 恢复写权限：pagehide 释放控制权后（历史缓存返回）需重新取锁再写，
+      // 避免在没有独占锁的情况下写入共享槽位
+      if (!isMemoryOnlySession() && !lock.held.value) {
+        const granted = await lock.request()
+        if (!granted) {
+          // 其他标签页持有控制权：保留内存进度与失败提示，等待用户选择
+          return
+        }
       }
       // 重试前检查旧槽位仍匹配本页最后成功保存的签名；不匹配按冲突处理
       if (persistence.retrySave(state.value, writerId)) {
@@ -384,9 +471,18 @@ export function useUnoGame() {
     })
   }
 
+  /** 仅在此页继续：进入内存模式，保留本页进度（槽位冲突后同样可用）。 */
   function continueInMemoryOnly() {
     enqueue(() => {
+      if (state.value === null) {
+        return
+      }
       persistence.enterMemoryOnly()
+      if (status.value === 'slot-conflict') {
+        // 用户选择保留本页未保存的进度继续，而不是加载外部存档
+        slotProblemKind.value = null
+        status.value = 'playing'
+      }
       aiTurn.schedule()
     })
   }
@@ -400,8 +496,13 @@ export function useUnoGame() {
         lock.release()
       }
       controlMode.value = 'locked'
-      entrySave.value = persistence.loadInitial()
-      status.value = entrySave.value.status === 'invalid' ? 'invalid-save' : 'entry'
+      const load = persistence.loadInitial()
+      if (load.status === 'invalid') {
+        enterInvalidSave(load)
+        return
+      }
+      entrySave.value = load
+      status.value = 'entry'
     })
   }
 
@@ -416,13 +517,26 @@ export function useUnoGame() {
   }
 
   /**
-   * 从历史缓存（bfcache）返回：重新争取锁并读取最新存档，再恢复可操作状态；
-   * 未取得锁时显示只读状态。旧请求已在 pagehide 时作废，不会执行也不会触发兜底。
+   * 从历史缓存（bfcache）返回：按控制模式与保存状态区分恢复路径。
+   * - 临时对局 / 仅此页继续：内存进度是唯一事实来源，不读共享槽位、不依赖锁；
+   * - 保存失败：保留未保存的内存进度，重新取锁后核对槽位签名；锁不可用或槽位变化时
+   *   不写入、不自动推进，交由界面提示用户在"重试保存 / 仅此页继续 / 重新加载"间选择；
+   * - 已保存对局：重新争取锁并读取最新存档，未取得锁时显示只读状态。
+   * 旧请求已在 pagehide 时作废，不会执行也不会触发兜底。
    */
   function handleRestored() {
     void enqueue(async () => {
       aiTurn.cancelAll()
       const wasPlaying = status.value === 'playing'
+      if (wasPlaying && isMemoryOnlySession()) {
+        // 内存进度是唯一事实来源：不读共享槽位，也不需要控制权
+        aiTurn.schedule()
+        return
+      }
+      if (wasPlaying && persistence.saveHealth.value === 'failed') {
+        await restoreFailedSession()
+        return
+      }
       const granted = await lock.request()
       if (!granted) {
         entrySave.value = persistence.readForDisplay()
@@ -440,7 +554,7 @@ export function useUnoGame() {
         }
         else if (load.status === 'invalid') {
           state.value = null
-          status.value = 'invalid-save'
+          enterInvalidSave(load)
         }
         else {
           state.value = null
@@ -449,13 +563,33 @@ export function useUnoGame() {
         return
       }
       if (load.status === 'invalid') {
-        status.value = 'invalid-save'
+        enterInvalidSave(load)
         return
       }
       if (status.value === 'readonly-locked' || status.value === 'no-lock-browser') {
         status.value = 'entry'
       }
     })
+  }
+
+  /**
+   * 保存失败的对局从历史缓存返回：内存里是尚未写入槽位的进度。
+   * 恢复写权限前先重新取锁并核对槽位签名；锁不可用或槽位已变化时不写入、
+   * 不自动推进，保留内存进度与"重试保存 / 仅在此页继续 / 重新加载"入口供用户选择。
+   */
+  async function restoreFailedSession() {
+    // 状态保持 playing：内存进度是用户可见的唯一进度，failed 会阻止自动推进
+    const granted = await lock.request()
+    if (!granted) {
+      // 其他标签页持有控制权：本页只保留内存进度，重试保存会再次争取锁
+      return
+    }
+    const verify = persistence.verifySlot()
+    if (verify === 'conflict' || verify === 'missing') {
+      // 槽位已被外部改写 / 删除：停止写入并让用户选择保留本页进度还是加载外部存档
+      handleSlotProblem(verify)
+    }
+    // 保持 failed：不调度 AI，等待用户重试保存或选择仅在此页继续
   }
 
   function handleVisibility() {

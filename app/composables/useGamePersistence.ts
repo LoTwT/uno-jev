@@ -48,6 +48,10 @@ export interface GamePersistence {
   enterMemoryOnly: () => void
   /** 用户确认后清除无法读取的存档。 */
   clearSlot: () => void
+  /** 读取槽位原始内容（不解析）；用于确认清除坏档前比较内容是否已被其他页面替换。 */
+  readRawSlot: () => string | null
+  /** 载入槽位快照后内存与槽位一致：清除写入失败标记（memory-only 是用户选择，不受影响）。 */
+  clearWriteFailure: () => void
   /** 只读页读取最新槽位用于展示（经校验才更新）。 */
   readForDisplay: () => InitialLoad
 }
@@ -243,6 +247,16 @@ export function useGamePersistence(): GamePersistence {
     saveHealth.value = 'memory-only'
   }
 
+  function readRawSlot(): string | null {
+    return readRaw()
+  }
+
+  function clearWriteFailure() {
+    if (saveHealth.value === 'failed') {
+      saveHealth.value = 'ok'
+    }
+  }
+
   function clearSlot() {
     try {
       window.localStorage.removeItem(SAVE_KEY)
@@ -266,6 +280,8 @@ export function useGamePersistence(): GamePersistence {
     retrySave,
     enterMemoryOnly,
     clearSlot,
+    readRawSlot,
+    clearWriteFailure,
     readForDisplay,
   }
 }

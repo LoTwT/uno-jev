@@ -3,7 +3,7 @@ import type { GameState } from '#shared/game'
 // 覆盖空玩家、缺失字段、错误手牌、阶段与庄家等场景；校验失败时保留原始槽位。
 import { describe, expect, it } from 'vitest'
 import { loadSaveEnvelope, serializeSaveEnvelope, validateState } from '#shared/game'
-import { cardOf, makeGame } from '../rules/helpers'
+import { cardOf, makeGame, submitOk } from '../rules/helpers'
 
 const WRITER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
@@ -22,6 +22,30 @@ function validState(): GameState {
 
 function mutate(mutator: (state: Record<string, unknown>) => void): unknown {
   const state = structuredClone(validState()) as unknown as Record<string, unknown>
+  mutator(state)
+  return state
+}
+
+/**
+ * 合法 after-draw 状态：p0 抽到可出的 red-9-2 后停在决策点。
+ * 用于验证依赖当前手牌的语义校验（归属 / 可出性）在结构被破坏时受控失败。
+ */
+function afterDrawState(): GameState {
+  const state = validState()
+  const pile = [...state.drawPile]
+  pile.splice(pile.indexOf('red-9-2'), 1)
+  pile.push('red-9-2')
+  state.drawPile = pile
+  const afterDraw = submitOk(state, 'p0', { type: 'draw-one' })
+  if (afterDraw.phase.kind !== 'after-draw') {
+    throw new Error('afterDrawState: 未进入 after-draw 阶段')
+  }
+  return afterDraw
+}
+
+/** 复制一份合法 after-draw 状态并按 JSON 结构改写（可删除字段）。 */
+function mutateAfterDraw(mutator: (state: Record<string, unknown>) => void): unknown {
+  const state = structuredClone(afterDrawState()) as unknown as Record<string, unknown>
   mutator(state)
   return state
 }
@@ -182,6 +206,82 @@ describe('validateState 对任意 JSON 结构不抛异常（问题 5）', () => 
       if (!result!.ok) {
         expect(result!.reason).toBe('invalid-state')
       }
+    }
+  })
+})
+
+// 第二轮审查（问题 3）：合法 after-draw 状态的手牌被改成非数组时，
+// 归属校验（includes）与决策上下文构造必须先验证运行时结构，
+// 不能只记录结构错误后继续执行依赖有效结构的语义校验。
+describe('after-draw 畸形手牌受控失败（第二轮审查问题 3）', () => {
+  type PlayerRecord = Record<string, unknown>
+  const handOf = (state: Record<string, unknown>, index: number): PlayerRecord =>
+    (state.players as PlayerRecord[])[index]!
+
+  const shapes: Array<[string, () => unknown]> = [
+    ['hand 为对象', () => mutateAfterDraw((s) => { handOf(s, 0).hand = {} })],
+    ['hand 为数字', () => mutateAfterDraw((s) => { handOf(s, 0).hand = 7 })],
+    ['hand 为字符串', () => mutateAfterDraw((s) => { handOf(s, 0).hand = 'red-9-2' })],
+    ['hand 为 null', () => mutateAfterDraw((s) => { handOf(s, 0).hand = null })],
+    ['hand 缺失', () => mutateAfterDraw((s) => { delete handOf(s, 0).hand })],
+    ['hand 含非字符串项', () => mutateAfterDraw((s) => { handOf(s, 0).hand = ['red-9-2', 42] })],
+    ['hand 为空数组', () => mutateAfterDraw((s) => { handOf(s, 0).hand = [] })],
+    ['非行动者 hand 为对象', () => mutateAfterDraw((s) => { handOf(s, 2).hand = {} })],
+    ['drawnCardId 为对象', () => mutateAfterDraw((s) => { (s.phase as Record<string, unknown>).drawnCardId = {} })],
+  ]
+
+  for (const [label, build] of shapes) {
+    it(`${label}：validateState 受控失败且不抛异常`, () => {
+      expectRejected(build(), label)
+    })
+  }
+
+  it('畸形 JSON 经 loadSaveEnvelope 得到 invalid-state，而不是抛异常', () => {
+    for (const [label, build] of shapes) {
+      const raw = serializeSaveEnvelope({
+        schemaVersion: 1,
+        savedAt: '2026-09-20T00:00:00.000Z',
+        writerId: WRITER,
+        state: build() as GameState,
+      })
+      let result: ReturnType<typeof loadSaveEnvelope> | undefined
+      expect(() => {
+        result = loadSaveEnvelope(raw)
+      }, `${label} 不应抛异常`).not.toThrow()
+      expect(result!.ok, `${label} 应校验失败`).toBe(false)
+      if (!result!.ok) {
+        expect(result!.reason, label).toBe('invalid-state')
+      }
+    }
+  })
+
+  it('合法 after-draw 仍通过，且归属与可出性语义校验未被跳过', () => {
+    const base = afterDrawState()
+    expect(validateState(base)).toEqual({ ok: true })
+    const raw = serializeSaveEnvelope({
+      schemaVersion: 1,
+      savedAt: '2026-09-20T00:00:00.000Z',
+      writerId: WRITER,
+      state: base,
+    })
+    expect(loadSaveEnvelope(raw).ok, '合法 after-draw 存档应可读取').toBe(true)
+
+    // drawnCardId 不在当前手牌（结构完好，必须继续报告语义错误）
+    const notInHand = structuredClone(base) as unknown as Record<string, unknown>
+    ;(notInHand.phase as Record<string, unknown>).drawnCardId = 'blue-1-2'
+    const notInHandResult = validateState(notInHand)
+    expect(notInHandResult.ok).toBe(false)
+    if (!notInHandResult.ok) {
+      expect(notInHandResult.errors.join(';')).toContain('必须在当前手牌中')
+    }
+
+    // drawnCardId 在手牌中但当前不可出
+    const notPlayable = structuredClone(base) as unknown as Record<string, unknown>
+    ;(notPlayable.phase as Record<string, unknown>).drawnCardId = 'blue-9-1'
+    const notPlayableResult = validateState(notPlayable)
+    expect(notPlayableResult.ok).toBe(false)
+    if (!notPlayableResult.ok) {
+      expect(notPlayableResult.errors.join(';')).toContain('必须是可出的牌')
     }
   })
 })

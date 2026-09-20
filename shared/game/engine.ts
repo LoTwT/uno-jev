@@ -291,6 +291,8 @@ export function validateState(state: unknown): ValidationResult {
       }
       if (!Array.isArray(player.hand) || !player.hand.every(id => typeof id === 'string' && getCard(id) !== null)) {
         errors.push(`players[${i}].hand 必须是目录内 CardId 数组`)
+        // 手牌结构错误：后续依赖有效手牌的语义校验（归属与可出性）必须跳过，不能仅记录后继续
+        playersWellFormed = false
       }
       else if (player.unoDeclared === true && (player.hand as string[]).length !== 1) {
         errors.push(`players[${i}].unoDeclared 仅在剩 1 张时可为 true`)
@@ -413,15 +415,23 @@ export function validateState(state: unknown): ValidationResult {
         }
         const drawnCardId = phase.drawnCardId
         const current = Array.isArray(state.players)
-          ? (state.players as unknown[]).find(p => isPlainObject(p) && p.id === state.currentPlayerId) as { id: string, hand?: string[] } | undefined
+          ? (state.players as unknown[]).find(p => isPlainObject(p) && p.id === state.currentPlayerId) as { id: string, hand?: unknown } | undefined
           : undefined
+        // 归属与可出性校验依赖行动者的有效手牌数组；结构不成立时只报告结构错误，
+        // 不再调用 includes 或构造决策上下文（否则畸形存档会抛异常而不是受控失败）
+        const currentHand = playersWellFormed && current !== undefined && Array.isArray(current.hand)
+          ? current.hand as unknown[]
+          : null
         if (typeof drawnCardId !== 'string' || getCard(drawnCardId) === null) {
           errors.push('after-draw 阶段 drawnCardId 必须是目录内 CardId')
         }
-        else if (!current?.hand?.includes(drawnCardId)) {
+        else if (currentHand === null) {
+          // 行动者缺失或手牌结构错误已在上方报告：这里不做依赖结构的语义推断
+        }
+        else if (!currentHand.includes(drawnCardId)) {
           errors.push('after-draw.drawnCardId 必须在当前手牌中')
         }
-        else if (current && playersWellFormed) {
+        else {
           const ctx = buildDecisionContextFromState(state as unknown as GameState)
           if (ctx && !isDrawnCardPlayable(ctx, drawnCardId)) {
             errors.push('after-draw.drawnCardId 必须是可出的牌')
