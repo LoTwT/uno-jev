@@ -11,11 +11,13 @@ import type { GameState } from '#shared/game'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { enumerateCandidatesFromState, loadSaveEnvelope, projectForAi } from '#shared/game'
 import { SAVE_KEY } from '~/composables/useGamePersistence'
-import { cardOf, makeGame, submitOk } from '../rules/helpers'
+import { cardOf, makeGame, mulberry32, submitOk } from '../rules/helpers'
 import { FakeLockManager, FakeStorage, installLocks, installStorage, mountSession, settle } from './helpers'
 
 const WRITER = 'cccccccc-dddd-4eee-8fff-000000000000'
 const OTHER_WRITER = 'dddddddd-eeee-4fff-8aaa-111111111111'
+/** 固定随机输入：临时对局开局（庄家与洗牌）可重复，p0 先手。 */
+const HUMAN_FIRST_SEED = 36
 
 /** 构造 p0（真人）行动、抽牌必然合法的确定局面。 */
 function humanTurnState(): GameState {
@@ -113,6 +115,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // 恢复 Math.random 等替身：随机输入不泄漏到其他用例
+  vi.restoreAllMocks()
   restoreLocks()
 })
 
@@ -239,6 +243,8 @@ describe('恢复路径按控制模式与保存状态区分（第二轮审查问�
   it('临时对局（无 Web Locks）：恢复后保留当前状态，不进入 no-lock-browser', async () => {
     const restoreNoLocks = installLocks(null)
     try {
+      // 固定随机输入：临时对局的开局（庄家与洗牌）可重复，真人先手
+      vi.spyOn(Math, 'random').mockImplementation(mulberry32(HUMAN_FIRST_SEED))
       const { session } = mountTracked()
       await settle()
       expect(session().status.value).toBe('no-lock-browser')
@@ -260,24 +266,11 @@ describe('恢复路径按控制模式与保存状态区分（第二轮审查问�
       expect(session().persistence.saveHealth.value).toBe('memory-only')
       expect(session().lock.held.value, '临时对局不依赖锁').toBe(false)
 
-      // 临时对局继续可推进：真人回合直接行动，AI 回合由调度重新驱动（都不依赖锁）
-      const current = session().state.value!
-      if (current.currentPlayerId === 'p0') {
-        if (current.phase.kind === 'opening-color') {
-          session().chooseOpeningColor('red')
-        }
-        else {
-          humanAction(session)
-        }
-        await settle()
-        expect(session().state.value!.revision).toBeGreaterThan(revision)
-      }
-      else {
-        expect(
-          session().aiTurn.inFlight.value !== null || session().state.value!.revision > revision,
-          'AI 回合仍由调度推进',
-        ).toBe(true)
-      }
+      // 临时对局继续可推进：不依赖锁，也不写共享槽位
+      expect(session().state.value!.currentPlayerId, '该种子下真人先手').toBe('p0')
+      humanAction(session)
+      await settle()
+      expect(session().state.value!.revision).toBeGreaterThan(revision)
       expect(window.localStorage.getItem(SAVE_KEY), '临时对局不读写共享槽位').toBeNull()
     }
     finally {

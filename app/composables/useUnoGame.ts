@@ -263,13 +263,11 @@ export function useUnoGame() {
   }
 
   /**
-   * 入口操作前确保持有控制权（返回入口释放后可重新争取）。
+   * 入口操作前确保持有共享槽位的写权限：必须真正取得独占锁
+   * （内存对局不操作共享槽位，其"允许操作内存对局"不构成写权限，不能短路到这里），
    * 取得锁后重新读取最新存档：其他标签页可能在本页释放锁期间写入新进度。
    */
   async function ensureControl(): Promise<boolean> {
-    if (controlMode.value === 'temp') {
-      return true
-    }
     if (!lock.held.value) {
       const granted = await lock.request()
       if (!granted) {
@@ -324,6 +322,13 @@ export function useUnoGame() {
 
   async function startNewGame(confirmedSignature?: SaveSignature | null): Promise<StartNewGameResult> {
     const result = await enqueue(async (): Promise<StartNewGameResult> => {
+      // 内存对局（临时对局 / 仅此页继续）：再次开局只重建本页内存状态，
+      // 不读共享槽位、不取锁，也不进入覆盖确认 / 存档异常 / 清除流程
+      if (isMemoryOnlySession()) {
+        startInMemoryGame()
+        return 'started'
+      }
+      // 共享槽位写权限：必须真正持锁并重读槽位后才能覆盖
       if (!(await ensureControl())) {
         return 'blocked'
       }
@@ -348,6 +353,17 @@ export function useUnoGame() {
     })
     // 队列异常已由 enqueue 记录；此处按"未开始"处理，界面保持原状态
     return result ?? 'blocked'
+  }
+
+  /**
+   * 再次开局：只重建本页内存状态，共享槽位内容与 Web Locks 都不参与。
+   * 旧请求作废、使用新 gameId；保存状态保持"不保存"（临时对局 / 仅此页继续）。
+   */
+  function startInMemoryGame() {
+    aiTurn.cancelAll()
+    state.value = createGame({ gameId: freshUuid() })
+    status.value = 'playing'
+    aiTurn.schedule()
   }
 
   function continueGame() {
@@ -392,6 +408,11 @@ export function useUnoGame() {
    */
   function clearInvalidSaveAndStart() {
     enqueue(async () => {
+      // 内存对局没有共享槽位写权限：清除入口只重建本页内存对局，不删除或改写共享槽位
+      if (isMemoryOnlySession()) {
+        startInMemoryGame()
+        return
+      }
       if (!(await ensureControl())) {
         return
       }
@@ -651,6 +672,8 @@ export function useUnoGame() {
     && state.value.phase.kind !== 'finished',
   )
   const phaseKind = computed(() => state.value?.phase.kind ?? null)
+  /** 本页对局是否为内存对局（临时对局 / 仅此页继续）：界面据此跳过共享存档相关提示。 */
+  const memoryOnlySession = computed(() => isMemoryOnlySession())
   const drawnCardId = computed(() => {
     const phase = state.value?.phase
     return phase?.kind === 'after-draw' ? phase.drawnCardId : null
@@ -755,6 +778,7 @@ export function useUnoGame() {
     // 会话
     status,
     controlMode,
+    memoryOnlySession,
     entrySave,
     slotProblemKind,
     actionError,

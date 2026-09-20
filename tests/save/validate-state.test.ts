@@ -285,3 +285,71 @@ describe('after-draw 畸形手牌受控失败（第二轮审查问题 3）', () 
     }
   })
 })
+
+// 第三轮审查（问题 2）：合法 after-draw 状态的弃牌堆被改成 null / 删除时，
+// 决策上下文构造依赖有效弃牌堆，必须先验证结构再进入深层语义校验。
+describe('after-draw 畸形牌堆受控失败（第三轮审查问题 2）', () => {
+  const piles: Array<[string, () => unknown]> = [
+    ['discardPile 为 null', () => mutateAfterDraw((s) => { s.discardPile = null })],
+    ['discardPile 缺失', () => mutateAfterDraw((s) => { delete s.discardPile })],
+    ['discardPile 为字符串', () => mutateAfterDraw((s) => { s.discardPile = 'red-9-2' })],
+    ['discardPile 为数字', () => mutateAfterDraw((s) => { s.discardPile = 7 })],
+    ['discardPile 为对象', () => mutateAfterDraw((s) => { s.discardPile = {} })],
+    ['discardPile 含未知牌', () => mutateAfterDraw((s) => { s.discardPile = ['nope-1'] })],
+    ['drawPile 为 null', () => mutateAfterDraw((s) => { s.drawPile = null })],
+    ['drawPile 缺失', () => mutateAfterDraw((s) => { delete s.drawPile })],
+  ]
+
+  for (const [label, build] of piles) {
+    it(`${label}：validateState 受控失败且不抛异常`, () => {
+      expectRejected(build(), label)
+    })
+  }
+
+  it('畸形牌堆经 loadSaveEnvelope 得到 invalid-state，而不是抛异常', () => {
+    for (const [label, build] of piles) {
+      const raw = serializeSaveEnvelope({
+        schemaVersion: 1,
+        savedAt: '2026-09-20T00:00:00.000Z',
+        writerId: WRITER,
+        state: build() as GameState,
+      })
+      let result: ReturnType<typeof loadSaveEnvelope> | undefined
+      expect(() => {
+        result = loadSaveEnvelope(raw)
+      }, `${label} 不应抛异常`).not.toThrow()
+      expect(result!.ok, `${label} 应校验失败`).toBe(false)
+      if (!result!.ok) {
+        expect(result!.reason, label).toBe('invalid-state')
+      }
+    }
+  })
+
+  it('弃牌堆结构错误时跳过深层校验，但独立于牌堆的归属校验仍然报告', () => {
+    // 弃牌堆损坏：只报告结构错误，不构造决策上下文
+    const brokenDiscard = mutateAfterDraw((s) => {
+      s.discardPile = null
+    })
+    const brokenResult = validateState(brokenDiscard)
+    expect(brokenResult.ok).toBe(false)
+    if (!brokenResult.ok) {
+      const joined = brokenResult.errors.join(';')
+      expect(joined).toContain('discardPile 必须是目录内 CardId 数组')
+      expect(joined, '依赖弃牌堆的可出性校验应被跳过').not.toContain('必须是可出的牌')
+    }
+
+    // 抽牌堆损坏不影响归属校验（该检查只依赖玩家手牌与弃牌堆）
+    const brokenDraw = structuredClone(afterDrawState()) as unknown as Record<string, unknown>
+    ;(brokenDraw.phase as Record<string, unknown>).drawnCardId = 'blue-1-2'
+    brokenDraw.drawPile = null
+    const drawResult = validateState(brokenDraw)
+    expect(drawResult.ok).toBe(false)
+    if (!drawResult.ok) {
+      expect(drawResult.errors.join(';')).toContain('必须在当前手牌中')
+    }
+  })
+
+  it('合法 after-draw 的归属与可出性校验保持有效（回归保护）', () => {
+    expect(validateState(afterDrawState())).toEqual({ ok: true })
+  })
+})

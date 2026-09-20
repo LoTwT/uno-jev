@@ -314,6 +314,9 @@ export function validateState(state: unknown): ValidationResult {
     errors.push('currentPlayerId 必须是合法座位')
   }
 
+  // 结构良好的牌堆：阶段相关校验（after-draw 的归属与可出性）依赖有效弃牌堆，
+  // 缺失或类型错误时只报告结构错误，不再深入读取
+  const pilesWellFormed = { drawPile: false, discardPile: false }
   const allCardIds: string[] = []
   if (isPlainObject(state)) {
     for (const key of ['drawPile', 'discardPile'] as const) {
@@ -322,6 +325,7 @@ export function validateState(state: unknown): ValidationResult {
         errors.push(`${key} 必须是目录内 CardId 数组`)
       }
       else {
+        pilesWellFormed[key] = true
         allCardIds.push(...(pile as string[]))
       }
     }
@@ -417,16 +421,16 @@ export function validateState(state: unknown): ValidationResult {
         const current = Array.isArray(state.players)
           ? (state.players as unknown[]).find(p => isPlainObject(p) && p.id === state.currentPlayerId) as { id: string, hand?: unknown } | undefined
           : undefined
-        // 归属与可出性校验依赖行动者的有效手牌数组；结构不成立时只报告结构错误，
+        // 归属与可出性校验依赖行动者的手牌数组与有效弃牌堆；结构不成立时只报告结构错误，
         // 不再调用 includes 或构造决策上下文（否则畸形存档会抛异常而不是受控失败）
-        const currentHand = playersWellFormed && current !== undefined && Array.isArray(current.hand)
-          ? current.hand as unknown[]
-          : null
+        const semanticCheckAvailable = playersWellFormed && pilesWellFormed.discardPile
+          && current !== undefined && Array.isArray(current.hand)
+        const currentHand = semanticCheckAvailable ? current.hand as unknown[] : null
         if (typeof drawnCardId !== 'string' || getCard(drawnCardId) === null) {
           errors.push('after-draw 阶段 drawnCardId 必须是目录内 CardId')
         }
         else if (currentHand === null) {
-          // 行动者缺失或手牌结构错误已在上方报告：这里不做依赖结构的语义推断
+          // 行动者 / 手牌 / 弃牌堆的结构错误已在上方报告：这里不做依赖结构的语义推断
         }
         else if (!currentHand.includes(drawnCardId)) {
           errors.push('after-draw.drawnCardId 必须在当前手牌中')

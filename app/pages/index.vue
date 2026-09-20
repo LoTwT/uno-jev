@@ -138,6 +138,11 @@ const thinkingActorId = computed(() => session.aiTurn.inFlight.value?.actorId ??
 
 /** 已知存在需要确认的进行中对局（内存或入口存档）。 */
 function hasKnownInProgressGame(): boolean {
+  // 内存对局（临时对局 / 仅此页继续）与共享槽位无关：再次开局只重建本页状态，
+  // 不进入覆盖确认流程
+  if (session.memoryOnlySession.value) {
+    return false
+  }
   if (session.status.value === 'playing' && state.value && phaseKind.value !== 'finished') {
     return true
   }

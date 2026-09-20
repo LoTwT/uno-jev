@@ -10,7 +10,7 @@ import { defineComponent, h } from 'vue'
 import { loadSaveEnvelope, serializeSaveEnvelope } from '#shared/game'
 import { SAVE_KEY, useGamePersistence } from '~/composables/useGamePersistence'
 import { useUnoGame } from '~/composables/useUnoGame'
-import { cardOf, makeGame } from '../rules/helpers'
+import { cardOf, makeGame, mulberry32, submitOk } from '../rules/helpers'
 
 /** 立即授予的 Web Locks mock（S4 的锁细节由 lock.test.ts 覆盖）。 */
 function installGrantingLocks() {
@@ -75,6 +75,19 @@ function readSlot(): string | null {
 const WRITER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 const OTHER_WRITER = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
 
+/**
+ * 固定随机输入：开局（庄家与洗牌）可重复，测试前提明确。
+ * - HUMAN_FIRST_SEED：庄家 p3、p0 先手且抽牌后进入 after-draw，动作序列确定；
+ * - FORCED_AI_SEED：p3（AI）先手且只有唯一候选，开局后立即发生一次强制动作。
+ */
+const HUMAN_FIRST_SEED = 36
+const FORCED_AI_SEED = 11
+
+/** 固定 Math.random；每次调用都从同一序列开始，用例结束后由 afterEach 恢复。 */
+function seedRandom(seed: number) {
+  vi.spyOn(Math, 'random').mockImplementation(mulberry32(seed))
+}
+
 /** 进行中的有效对局（p0 行动）。 */
 function validInProgressState(): GameState {
   return makeGame({
@@ -109,11 +122,14 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // 恢复 Math.random 等替身：随机输入不泄漏到其他用例
+  vi.restoreAllMocks()
   delete (navigator as unknown as { locks?: unknown }).locks
 })
 
 describe('保存时机与存档内容（S3）', () => {
   it('创建新局后立即保存首个快照；动作后立即保存新快照', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const { wrapper, session } = mountSession()
     await settle()
 
@@ -123,6 +139,10 @@ describe('保存时机与存档内容（S3）', () => {
 
     expect(session().status.value).toBe('playing')
     const state = session().state.value!
+    // 该种子下真人先手且没有自动动作：首个快照就是 revision 0
+    expect(state.currentPlayerId).toBe('p0')
+    expect(state.phase.kind).toBe('turn')
+    expect(state.revision).toBe(0)
     const raw = readSlot()
     expect(raw).not.toBeNull()
     const envelope = loadSaveEnvelope(raw!)
@@ -133,28 +153,46 @@ describe('保存时机与存档内容（S3）', () => {
       expect(envelope.envelope.writerId).toBe(session().writerId)
     }
 
-    // 真人动作后立即保存（revision +1 的快照）
+    // 真人动作后立即保存（revision +1 的快照），存档与内存状态一致
     const before = structuredClone(state)
-    const isHumanFirst = state.currentPlayerId === 'p0' && state.phase.kind === 'turn'
-    if (isHumanFirst) {
-      session().drawOne()
-      await settle()
-      const updated = loadSaveEnvelope(readSlot()!)
-      expect(updated.ok).toBe(true)
-      if (updated.ok) {
-        expect(updated.envelope.state.revision).toBe(before.revision + 1)
-      }
-      // 刷新不重复抽牌：存档阶段与内存状态一致
-      expect(session().state.value!.revision).toBe(before.revision + 1)
+    session().drawOne()
+    await settle()
+    const updated = loadSaveEnvelope(readSlot()!)
+    expect(updated.ok).toBe(true)
+    if (updated.ok) {
+      expect(updated.envelope.state.revision).toBe(before.revision + 1)
     }
-    else {
-      // 庄家随机，AI 先手的情形下快照仍应等于内存状态
-      expect(loadSaveEnvelope(readSlot()!)?.envelope?.state.revision ?? -1).toBe(0)
+    // 刷新不重复抽牌：存档阶段与内存状态一致
+    expect(session().state.value!.revision).toBe(before.revision + 1)
+    expect(session().state.value!.phase.kind).toBe('after-draw')
+    wrapper.unmount()
+  })
+
+  it('开局后立即发生强制 AI 动作：首个快照随自动推进同步保存（确定场景）', async () => {
+    seedRandom(FORCED_AI_SEED)
+    const { wrapper, session } = mountSession()
+    await settle()
+    session().startNewGame()
+    await settle()
+
+    // 该种子下 p3（AI）先手且只有唯一候选：开局后的强制动作把 revision 推进到 1，
+    // 首个快照保存的是推进后的状态，而不是被固定为 revision 0
+    const state = session().state.value!
+    expect(state.revision, '强制 AI 动作已推进').toBe(1)
+    expect(state.currentPlayerId).toBe('p0')
+    const envelope = loadSaveEnvelope(readSlot()!)
+    expect(envelope.ok).toBe(true)
+    if (envelope.ok) {
+      expect(envelope.envelope.state.gameId).toBe(state.gameId)
+      expect(envelope.envelope.state.revision).toBe(1)
     }
+    // 内存与槽位一致：刷新后不会重放这次强制动作
+    expect(session().persistence.saveHealth.value).toBe('ok')
     wrapper.unmount()
   })
 
   it('存档 envelope 结构：schemaVersion 1 + savedAt + writerId + 完整状态', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const { wrapper, session } = mountSession()
     await settle()
     session().startNewGame()
@@ -170,6 +208,7 @@ describe('保存时机与存档内容（S3）', () => {
 
 describe('写入失败处理（S3）', () => {
   it('写入失败：保留旧槽位、内存状态保留、暂停自动推进、可重试', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const fake = new FakeStorage()
     const restoreStorage = installStorage(fake)
     try {
@@ -180,24 +219,14 @@ describe('写入失败处理（S3）', () => {
       expect(session().persistence.saveHealth.value).toBe('ok')
       const firstRaw = readSlot()!
 
-      // 模拟 quota 错误
+      // 模拟 quota 错误：真人动作真实推进内存状态，写入失败保留旧槽位
       fake.failSet = true
-      const humanTurn = session().state.value!.currentPlayerId === 'p0' && session().state.value!.phase.kind === 'turn'
-      if (humanTurn) {
-        session().drawOne()
-        await settle()
-        expect(session().persistence.saveHealth.value).toBe('failed')
-        expect(readSlot()).toBe(firstRaw)
-        expect(session().state.value!.revision).toBe(1)
-      }
-      else {
-        // AI 先手：直接持久化一个修改过的快照（revision 推进）触发写入失败
-        const bumped = { ...structuredClone(session().state.value!), revision: session().state.value!.revision + 1 }
-        const failed = session().persistence.persist(bumped, 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')
-        expect(failed).toBe(false)
-        expect(session().persistence.saveHealth.value).toBe('failed')
-        expect(readSlot()).toBe(firstRaw)
-      }
+      expect(session().state.value!.currentPlayerId).toBe('p0')
+      session().drawOne()
+      await settle()
+      expect(session().persistence.saveHealth.value).toBe('failed')
+      expect(readSlot()).toBe(firstRaw)
+      expect(session().state.value!.revision).toBe(1)
 
       // 重试保存成功（故障恢复）
       fake.failSet = false
@@ -216,6 +245,7 @@ describe('写入失败处理（S3）', () => {
   })
 
   it('仅在此页继续：进入内存模式后不再写共享槽位', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const { wrapper, session } = mountSession()
     await settle()
     session().startNewGame()
@@ -226,18 +256,18 @@ describe('写入失败处理（S3）', () => {
     await settle()
     expect(session().persistence.saveHealth.value).toBe('memory-only')
 
-    if (session().state.value!.currentPlayerId === 'p0' && session().state.value!.phase.kind === 'turn') {
-      session().drawOne()
-      await settle()
-      // 内存模式下槽位不再更新
-      expect(readSlot()).toBe(rawBefore)
-      // 但本页状态继续推进
-      expect(session().state.value!.revision).toBe(1)
-    }
+    expect(session().state.value!.currentPlayerId).toBe('p0')
+    session().drawOne()
+    await settle()
+    // 内存模式下槽位不再更新
+    expect(readSlot()).toBe(rawBefore)
+    // 但本页状态继续推进
+    expect(session().state.value!.revision).toBe(1)
     wrapper.unmount()
   })
 
   it('持续配额不足：重试保存失败保持当前对局与失败入口，不进入槽位冲突（问题 3 回归）', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const fake = new FakeStorage()
     const restoreStorage = installStorage(fake)
     try {
@@ -248,20 +278,14 @@ describe('写入失败处理（S3）', () => {
       expect(session().persistence.saveHealth.value).toBe('ok')
       const firstRaw = readSlot()!
 
-      // 写入开始持续失败
+      // 写入开始持续失败（真人动作真实推进内存状态）
       fake.failSet = true
-      const humanTurn = session().state.value!.currentPlayerId === 'p0' && session().state.value!.phase.kind === 'turn'
-      if (humanTurn) {
-        session().drawOne()
-      }
-      else {
-        // AI 先手：直接持久化一个推进过的快照触发失败
-        const bumped = { ...structuredClone(session().state.value!), revision: session().state.value!.revision + 1 }
-        session().persistence.persist(bumped, session().writerId)
-      }
+      expect(session().state.value!.currentPlayerId).toBe('p0')
+      session().drawOne()
       await settle()
       expect(session().persistence.saveHealth.value).toBe('failed')
       const memoryRevision = session().state.value!.revision
+      expect(memoryRevision).toBe(1)
 
       // 重试仍失败：必须保持 playing + failed，而不是 slot-conflict
       session().retrySave()
@@ -279,6 +303,7 @@ describe('写入失败处理（S3）', () => {
       expect(session().status.value).toBe('playing')
 
       // 存储恢复后（新局路径）保存重新可用：重试保存入口在 failed 状态下依然工作
+      seedRandom(HUMAN_FIRST_SEED)
       const { wrapper: wrapper2, session: session2 } = mountSession()
       await settle()
       // 槽位里还有上一个会话的进行中对局：按新局保护先确认覆盖
@@ -286,14 +311,8 @@ describe('写入失败处理（S3）', () => {
       expect(await session2().startNewGame(session2().currentSlotSignature())).toBe('started')
       await settle()
       fake.failSet = true
-      const humanTurn2 = session2().state.value!.currentPlayerId === 'p0' && session2().state.value!.phase.kind === 'turn'
-      if (humanTurn2) {
-        session2().drawOne()
-      }
-      else {
-        const bumped2 = { ...structuredClone(session2().state.value!), revision: session2().state.value!.revision + 1 }
-        session2().persistence.persist(bumped2, session2().writerId)
-      }
+      expect(session2().state.value!.currentPlayerId).toBe('p0')
+      session2().drawOne()
       await settle()
       expect(session2().persistence.saveHealth.value).toBe('failed')
       fake.failSet = false
@@ -310,6 +329,7 @@ describe('写入失败处理（S3）', () => {
   })
 
   it('storage 一开始就不可用：同样进入受控失败状态而非崩溃', async () => {
+    seedRandom(HUMAN_FIRST_SEED)
     const fake = new FakeStorage()
     fake.failSet = true
     const restoreStorage = installStorage(fake)
@@ -362,6 +382,26 @@ describe('坏存档加载（S2 会话侧）', () => {
     expect(session().status.value).toBe('playing')
     const after = loadSaveEnvelope(readSlot()!)
     expect(after.ok).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('畸形 after-draw 存档（弃牌堆为 null）：进入"存档无法读取"并保留原始槽位', async () => {
+    // 合法 after-draw 状态只破坏弃牌堆结构：加载必须受控失败，而不是抛异常或进入可交互状态
+    const afterDraw = validInProgressState()
+    const pile = [...afterDraw.drawPile]
+    pile.splice(pile.indexOf('red-9-2'), 1)
+    pile.push('red-9-2')
+    afterDraw.drawPile = pile
+    const broken = submitOk(afterDraw, 'p0', { type: 'draw-one' }) as unknown as Record<string, unknown>
+    expect((broken.phase as { kind: string }).kind).toBe('after-draw')
+    broken.discardPile = null
+    const raw = writeEnvelope(broken as unknown as GameState)
+
+    const { wrapper, session } = mountSession()
+    await settle()
+    expect(session().status.value, '页面进入"存档无法读取"').toBe('invalid-save')
+    expect(session().entrySave.value.status).toBe('invalid')
+    expect(readSlot(), '原始槽位保留').toBe(raw)
     wrapper.unmount()
   })
 
