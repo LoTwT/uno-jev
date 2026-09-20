@@ -87,7 +87,7 @@ describe('存储被禁用（问题 6）', () => {
       const wrapper = mount(host)
       await settle()
       expect(prefs.themeIntent.value).toBe('auto')
-      expect(prefs.settings.value).toEqual({ schemaVersion: 1, reducedMotion: 'system' })
+      expect(prefs.settings.value).toEqual({ schemaVersion: 1, reducedMotion: 'system', revealHands: false })
       expect(prefs.reducedMotion.value).toBe(false)
 
       // 内存中修改仍可用（不写存储）
