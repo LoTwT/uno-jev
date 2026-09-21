@@ -19,8 +19,9 @@ import { buildUpstreamPayload, handleAiDecision } from '../../server/utils/aiDec
 const HOST = 'unojev.test'
 const ORIGIN = `https://${HOST}`
 const KEY_MARKER = 'ts_secret_key_marker_0123456789abcdef'
+const PERSONAL_KEY_MARKER = 'ts_personal_key_marker_0123456789abcdef'
 const MODEL = 'jev-1.13.0'
-const RUNTIME = { typesafeApiKey: KEY_MARKER, typesafeModel: MODEL }
+const RUNTIME = { typesafeApiKey: KEY_MARKER, typesafeModel: MODEL, siteQuotaExhausted: false }
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0
@@ -65,10 +66,11 @@ function buildGameAt(actor: 'p1' | 'p2' | 'p3', seed = 1): GameState {
   throw new Error('无法构造目标状态')
 }
 
-function buildRequest(state: GameState, actor: 'p1' | 'p2' | 'p3', decisionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'): AiDecisionRequest {
+function buildRequest(state: GameState, actor: 'p1' | 'p2' | 'p3', decisionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', credentialSource: 'site' | 'personal' = 'site'): AiDecisionRequest {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     rulesVersion: 'classic-single-v1',
+    credentialSource,
     gameId: state.gameId,
     revision: state.revision,
     decisionId,
@@ -129,6 +131,7 @@ function baseParams(request: AiDecisionRequest, overrides: Partial<Parameters<ty
     contentType: 'application/json',
     contentLength: null,
     bodyText: JSON.stringify(request),
+    personalKey: null,
     runtimeConfig: RUNTIME,
     ...overrides,
   }
@@ -153,7 +156,7 @@ describe('成功路径与上游适配', () => {
       throw new Error('不应失败')
     }
     expect(result.body).toEqual({
-      protocolVersion: 1,
+      protocolVersion: 2,
       gameId: request.gameId,
       revision: request.revision,
       decisionId: request.decisionId,
@@ -286,7 +289,9 @@ describe('请求校验（A2）', () => {
     const cases: Array<[string, Partial<Parameters<typeof handleAiDecision>[0]>]> = [
       ['坏 JSON', { bodyText: '{oops' }],
       ['未知顶层字段', { bodyText: JSON.stringify({ ...request, evil: 'x' }) }],
-      ['协议版本', { bodyText: JSON.stringify({ ...request, protocolVersion: 2 }) }],
+      ['缺少 credentialSource 字段', { bodyText: JSON.stringify((({ credentialSource: _ignored, ...rest }) => rest)(request)) }],
+      ['credentialSource 非法值', { bodyText: JSON.stringify({ ...request, credentialSource: 'admin' }) }],
+      ['协议版本', { bodyText: JSON.stringify({ ...request, protocolVersion: 3 }) }],
       ['规则版本', { bodyText: JSON.stringify({ ...request, rulesVersion: 'other-v1' }) }],
       ['gameId 非 UUID', { bodyText: JSON.stringify({ ...request, gameId: 'nope' }) }],
       ['decisionId 非 UUID', { bodyText: JSON.stringify({ ...request, decisionId: 'nope' }) }],
@@ -442,12 +447,13 @@ describe('请求校验（A2）', () => {
   })
 })
 
-describe('上游错误映射（A3）', () => {
+describe('上游错误映射（A3：限流 / 过载 / 鉴权按凭据归属区分）', () => {
   const cases: Array<[string, number, unknown, number, string, Record<string, string>?]> = [
-    ['上游 429', 429, {}, 429, 'ai_rate_limited', { 'retry-after': '60' }],
-    ['上游 529', 529, {}, 429, 'ai_rate_limited', undefined],
-    ['上游 401', 401, {}, 503, 'ai_unavailable', undefined],
-    ['上游 403', 403, {}, 503, 'ai_unavailable', undefined],
+    ['上游 429 → 调用方限流', 429, {}, 429, 'ai_rate_limited', { 'retry-after': '60' }],
+    ['上游 529 → 服务方过载（区别于限流）', 529, {}, 503, 'ai_overloaded', { 'retry-after': '15' }],
+    ['上游 529 无 Retry-After → 仅错误码', 529, {}, 503, 'ai_overloaded', undefined],
+    ['上游 401（站点密钥）→ ai_unavailable', 401, {}, 503, 'ai_unavailable', undefined],
+    ['上游 403（站点密钥）→ ai_unavailable', 403, {}, 503, 'ai_unavailable', undefined],
     ['上游 422', 422, {}, 502, 'ai_upstream_error', undefined],
     ['上游 500', 500, {}, 502, 'ai_upstream_error', undefined],
     ['非 JSON 响应', 200, 'not json at all', 502, 'ai_invalid_response', undefined],
@@ -463,8 +469,22 @@ describe('上游错误映射（A3）', () => {
       if (headers?.['retry-after']) {
         expect(result.headers['Retry-After']).toBe(headers['retry-after'])
       }
+      else {
+        expect(result.headers['Retry-After']).toBeUndefined()
+      }
     })
   }
+
+  it('个人 Key 请求：上游 401/403 → ai_key_rejected（归属用户自己的 Key）', async () => {
+    for (const status of [401, 403]) {
+      const state = buildGameAt('p1')
+      const request = buildRequest(state, 'p1', undefined, 'personal')
+      const { impl } = mockFetch(status, {})
+      const result = await handleAiDecision(baseParams(request, { personalKey: PERSONAL_KEY_MARKER, fetchImpl: impl }))
+      expect(result.status, `上游 ${status}`).toBe(503)
+      expect(result.body, `上游 ${status}`).toEqual({ error: { code: 'ai_key_rejected' }, decisionId: request.decisionId })
+    }
+  })
 
   it('上游响应结构缺失或非法 → 502 ai_invalid_response', async () => {
     const state = buildGameAt('p1')
@@ -515,17 +535,139 @@ describe('上游错误映射（A3）', () => {
     expect(result.body).toEqual({ error: { code: 'ai_upstream_error' }, decisionId: request.decisionId })
   })
 
-  it('缺 API key 配置 → 503 ai_unavailable，不调用上游', async () => {
+  it('缺 API key 配置（站点来源）→ 503 ai_unavailable，不调用上游', async () => {
     const state = buildGameAt('p1')
     const request = buildRequest(state, 'p1')
     const { impl, calls } = mockFetch(200, {})
     const result = await handleAiDecision(baseParams(request, {
       fetchImpl: impl,
-      runtimeConfig: { typesafeApiKey: '', typesafeModel: MODEL },
+      runtimeConfig: { typesafeApiKey: '', typesafeModel: MODEL, siteQuotaExhausted: false },
     }))
     expect(result.status).toBe(503)
     expect(result.body).toEqual({ error: { code: 'ai_unavailable' }, decisionId: request.decisionId })
     expect(calls).toHaveLength(0)
+  })
+
+  it('缺模型配置（个人来源）→ 503 ai_unavailable（服务端配置问题，不归咎个人 Key）', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1', undefined, 'personal')
+    const { impl, calls } = mockFetch(200, {})
+    const result = await handleAiDecision(baseParams(request, {
+      personalKey: PERSONAL_KEY_MARKER,
+      fetchImpl: impl,
+      runtimeConfig: { typesafeApiKey: '', typesafeModel: '', siteQuotaExhausted: false },
+    }))
+    expect(result.status).toBe(503)
+    expect(result.body).toEqual({ error: { code: 'ai_unavailable' }, decisionId: request.decisionId })
+    expect(calls).toHaveLength(0)
+  })
+})
+
+describe('凭据来源选择与个人 Key 传递', () => {
+  it('个人 Key 请求：上游 Authorization 使用个人 Key，站点密钥不被使用或泄露', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1', undefined, 'personal')
+    const { impl, calls } = mockFetch(200, successBody(request.candidates))
+    const { entries, fn } = logs()
+    const result = await handleAiDecision(baseParams(request, { personalKey: PERSONAL_KEY_MARKER, fetchImpl: impl, log: fn }))
+
+    expect(result.status).toBe(200)
+    expect(calls).toHaveLength(1)
+    const auth = new Headers(calls[0]!.init.headers as HeadersInit).get('authorization')
+    expect(auth).toBe(`Bearer ${PERSONAL_KEY_MARKER}`)
+    // 个人模式不消耗站点密钥：站点密钥不出现在上游调用与任何输出中
+    expect(JSON.stringify(calls[0]!.init.body)).not.toContain(KEY_MARKER)
+    expect(JSON.stringify(result)).not.toContain(KEY_MARKER)
+    expect(JSON.stringify(entries)).not.toContain(KEY_MARKER)
+    // 个人 Key 本身不进入请求体、响应或日志（只经专用请求头 → 上游 Authorization）
+    expect(JSON.stringify(calls[0]!.init.body)).not.toContain(PERSONAL_KEY_MARKER)
+    expect(JSON.stringify(result)).not.toContain(PERSONAL_KEY_MARKER)
+    expect(JSON.stringify(entries)).not.toContain(PERSONAL_KEY_MARKER)
+    // 日志记录凭据来源（诊断字段，不含密钥值）
+    expect(entries[0]).toMatchObject({ credentialSource: 'personal', status: 200 })
+  })
+
+  it('个人 Key 请求：Key 只经请求头传递，不进入本站请求体与上游 payload', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1', undefined, 'personal')
+    const { impl, calls } = mockFetch(200, successBody(request.candidates))
+    const params = baseParams(request, { personalKey: PERSONAL_KEY_MARKER, fetchImpl: impl })
+    // 本站请求体声明来源，但不含 Key 值
+    const requestJson = JSON.parse(params.bodyText) as Record<string, unknown>
+    expect(requestJson.credentialSource).toBe('personal')
+    expect(params.bodyText).not.toContain(PERSONAL_KEY_MARKER)
+    await handleAiDecision(params)
+    // 上游 payload 同样不含 Key 值
+    expect(JSON.stringify(calls[0]!.init.body)).not.toContain(PERSONAL_KEY_MARKER)
+  })
+
+  it('personal 声明但缺少请求头 / 格式非法 → 400，不调用上游，不回退站点密钥', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1', undefined, 'personal')
+    const { impl, calls } = mockFetch(200, {})
+    const cases: Array<[string, string | null]> = [
+      ['缺少请求头', null],
+      ['空字符串', ''],
+      ['超长', 'a'.repeat(257)],
+      ['含空格', 'bad key'],
+      ['含控制字符', 'bad\nkey'],
+    ]
+    for (const [name, personalKey] of cases) {
+      const result = await handleAiDecision(baseParams(request, { personalKey, fetchImpl: impl }))
+      expect(result.status, name).toBe(400)
+      expect(result.body, name).toEqual({ error: { code: 'invalid_request' }, decisionId: request.decisionId })
+    }
+    expect(calls).toHaveLength(0)
+  })
+
+  it('site 声明却携带个人 Key 头 → 400（来源矛盾，避免凭据歧义）', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    const { impl, calls } = mockFetch(200, {})
+    const result = await handleAiDecision(baseParams(request, { personalKey: PERSONAL_KEY_MARKER, fetchImpl: impl }))
+    expect(result.status).toBe(400)
+    expect(result.body).toEqual({ error: { code: 'invalid_request' }, decisionId: request.decisionId })
+    expect(calls).toHaveLength(0)
+  })
+
+  it('站点额度耗尽开关：站点来源 → 503 ai_site_quota_exhausted，不调用上游', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1')
+    const { impl, calls } = mockFetch(200, {})
+    const { entries, fn } = logs()
+    const result = await handleAiDecision(baseParams(request, {
+      fetchImpl: impl,
+      log: fn,
+      runtimeConfig: { typesafeApiKey: KEY_MARKER, typesafeModel: MODEL, siteQuotaExhausted: true },
+    }))
+    expect(result.status).toBe(503)
+    expect(result.body).toEqual({ error: { code: 'ai_site_quota_exhausted' }, decisionId: request.decisionId })
+    expect(calls).toHaveLength(0)
+    expect(entries[0]).toMatchObject({ code: 'ai_site_quota_exhausted', credentialSource: 'site' })
+  })
+
+  it('站点额度耗尽开关不影响个人 Key 请求：正常调用上游', async () => {
+    const state = buildGameAt('p1')
+    const request = buildRequest(state, 'p1', undefined, 'personal')
+    const { impl, calls } = mockFetch(200, successBody(request.candidates))
+    const result = await handleAiDecision(baseParams(request, {
+      personalKey: PERSONAL_KEY_MARKER,
+      fetchImpl: impl,
+      runtimeConfig: { typesafeApiKey: '', typesafeModel: MODEL, siteQuotaExhausted: true },
+    }))
+    expect(result.status).toBe(200)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('上游 429 不被误判为额度耗尽：返回 ai_rate_limited（站点与个人一致）', async () => {
+    for (const [source, personalKey] of [['site', null], ['personal', PERSONAL_KEY_MARKER]] as const) {
+      const state = buildGameAt('p1')
+      const request = buildRequest(state, 'p1', undefined, source)
+      const { impl } = mockFetch(429, {}, { 'retry-after': '30' })
+      const result = await handleAiDecision(baseParams(request, { personalKey, fetchImpl: impl }))
+      expect(result.status, source).toBe(429)
+      expect(result.body, source).toEqual({ error: { code: 'ai_rate_limited' }, decisionId: request.decisionId })
+    }
   })
 })
 

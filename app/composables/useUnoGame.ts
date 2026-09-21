@@ -18,11 +18,12 @@ import type { InitialLoad, SaveSignature } from './useGamePersistence'
  * 页面组件不重复实现规则；保存时机为引擎完成整次转换后立即保存，
  * 先保存再开放下一操作 / 启动下一 AI 请求（规格：模块职责与信任边界）。
  */
-import { computed, onMounted, ref, shallowRef } from 'vue'
+import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { applyAction, createGame, getCard, isWildKind } from '#shared/game'
 import { useAiTurn } from './useAiTurn'
 import { useGameLock, webLocksSupported } from './useGameLock'
 import { envelopeSignature, sameSignature, useGamePersistence } from './useGamePersistence'
+import { useJevCredentials } from './useJevCredentials'
 
 export type SessionStatus
   = | 'boot'
@@ -71,6 +72,8 @@ export function useUnoGame() {
 
   const persistence = useGamePersistence()
   const lock = useGameLock()
+  /** Jev 凭据配置：站点额度 / 个人 Key（设置不受游戏锁限制）。 */
+  const jevCredentials = useJevCredentials()
 
   /**
    * 本页对局不再读写共享槽位：临时对局（无 Web Locks / 存储不可用），
@@ -97,9 +100,16 @@ export function useUnoGame() {
   const aiTurn = useAiTurn({
     getState: () => state.value,
     canAdvance,
+    getCredential: () => jevCredentials.credential.value,
     submitAction: (actorId, action, meta) => submitAction(actorId, action, meta),
     // 开发诊断（仅本地控制台；不含密钥或暗牌）
     devLog: message => console.warn(`[unojev][diagnostic] ${message}`),
+  })
+
+  // 凭据变更（保存 / 替换 / 删除 Key、切换来源、挂载恢复记住的 Key）：
+  // 作废在途请求并按当前对局状态重新调度；已落地的兜底动作不重放
+  watch(jevCredentials.credential, () => {
+    aiTurn.onCredentialsChanged()
   })
 
   // ---- 串行命令队列 -------------------------------------------------------
@@ -547,6 +557,9 @@ export function useUnoGame() {
    */
   function handleRestored() {
     void enqueue(async () => {
+      // bfcache 期间收不到 storage 事件：先重同步凭据（另一标签页可能已删除 /
+      // 替换记住的 Key）；同步导致的有效凭据变化走既有的失效与重调度流程
+      jevCredentials.resyncFromStorage()
       aiTurn.cancelAll()
       const wasPlaying = status.value === 'playing'
       if (wasPlaying && isMemoryOnlySession()) {
@@ -817,5 +830,7 @@ export function useUnoGame() {
     aiTurn,
     lock,
     writerId,
+    // Jev 凭据（站点额度 / 个人 Key）
+    jevCredentials,
   }
 }

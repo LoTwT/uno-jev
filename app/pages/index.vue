@@ -6,15 +6,95 @@
 import type { Card, Color } from '#shared/game'
 import { usePreferences } from '~/composables/usePreferences'
 import { useUnoGame } from '~/composables/useUnoGame'
+import { useVersionedDismissal } from '~/composables/useVersionedDismissal'
 import { cardLabel, eventDescription } from '~/utils/display'
 
 const session = useUnoGame()
 const { themeIntent, setTheme, reducedMotion, setReducedMotion, revealHands, setRevealHands } = usePreferences()
+const jev = session.jevCredentials
 
 const rulesOpen = ref(false)
 const confirmNewGame = ref(false)
 /** 新局确认对话框中的动态提示（存档变化 / 未确认对局）。 */
 const confirmNotice = ref<string | null>(null)
+
+// ---- Jev 设置与凭据提示 ----
+const jevSettingsOpen = ref(false)
+/** 额度提示的确认状态：会话内粘滞（额度耗尽由运营者声明，与 Key 无关）。 */
+const quotaNoticeDismissed = ref(false)
+/**
+ * Key 被拒 / 缺 Key 提示的确认状态：绑定到个人 Key 版本——同一 Key 的连续失败
+ * 不重复打扰；替换或删除 Key 后版本递增，新 Key 的失败会重新显示原因与修改入口。
+ */
+const rejectedDismissal = useVersionedDismissal(jev.personalKeyVersion)
+const missingDismissal = useVersionedDismissal(jev.personalKeyVersion)
+
+const jevSourceLabel = computed(() => (jev.source.value === 'personal' ? '你的 Key' : '站点额度'))
+/** 站点额度确认耗尽：仅站点来源且未确认时显示（额度状态为会话内粘滞）。 */
+const showQuotaNotice = computed(() =>
+  session.status.value === 'playing'
+  && jev.source.value === 'site'
+  && session.aiTurn.siteQuotaExhausted.value
+  && !quotaNoticeDismissed.value,
+)
+/** 个人 Key 被上游拒绝：归属于用户自己的 Key，提供修改入口。 */
+const showRejectedNotice = computed(() =>
+  session.status.value === 'playing'
+  && jev.source.value === 'personal'
+  && session.aiTurn.jevPaused.value
+  && session.aiTurn.personalPauseReason.value === 'key_rejected'
+  && !rejectedDismissal.dismissed.value,
+)
+/** 已选择个人来源但尚未输入 Key：明确提示，不悄悄消耗站点额度。 */
+const showMissingNotice = computed(() =>
+  session.status.value === 'playing'
+  && jev.source.value === 'personal'
+  && !jev.hasPersonalKey.value
+  && !missingDismissal.dismissed.value,
+)
+/** 站点来源暂停（ai_unavailable）：既有暂停提示，补充配置个人 Key 入口。 */
+const showSitePauseNotice = computed(() =>
+  session.status.value === 'playing'
+  && jev.source.value === 'site'
+  && session.aiTurn.jevPaused.value,
+)
+/** 个人来源暂停但非 Key 拒绝（服务端配置等）：沿用通用暂停提示。 */
+const showPersonalUnavailableNotice = computed(() =>
+  session.status.value === 'playing'
+  && jev.source.value === 'personal'
+  && session.aiTurn.jevPaused.value
+  && session.aiTurn.personalPauseReason.value !== 'key_rejected',
+)
+
+function openJevSettings() {
+  jevSettingsOpen.value = true
+}
+
+/** 额度 / Key 提示条的主操作：切换到个人来源并打开设置（未输入 Key 前规则兜底继续）。 */
+function useOwnKeyFromNotice() {
+  jev.setSource('personal')
+  openJevSettings()
+}
+
+function onSetJevSource(source: 'site' | 'personal') {
+  jev.setSource(source)
+}
+
+function onSaveJevKey(key: string) {
+  jev.savePersonalKey(key)
+}
+
+function onSetJevRemember(enabled: boolean) {
+  jev.setRememberKey(enabled)
+}
+
+function onDeleteJevKey() {
+  jev.deletePersonalKey()
+}
+
+function onRetryJevPersist() {
+  jev.retryPersist()
+}
 
 // ---- 真人选牌草稿（选色前不移牌；刷新放弃草稿） ----
 const selectedCardId = ref<string | null>(null)
@@ -233,12 +313,20 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
           title="减少动态效果（关闭位移动画）"
           @click="setReducedMotion(reducedMotion ? 'system' : 'reduce')"
         >
-          {{ reducedMotion ? '动态：已减少' : '动态：跟随系统' }}
+          动态<span class="hidden sm:inline">{{ reducedMotion ? '：已减少' : '：跟随系统' }}</span>
         </button>
         <ThemeToggle :intent="themeIntent" @set="setTheme" />
+        <!-- Jev 设置：首页与对局中均可找到（设置不受游戏锁限制） -->
         <button
           type="button"
-          class="min-h-11 px-3 rounded-lg border border-[var(--border-default)] text-sm hover:bg-[var(--surface-subtle)]"
+          class="min-h-11 px-3 rounded-lg border border-[var(--border-default)] text-sm hover:bg-[var(--surface-subtle)] whitespace-nowrap"
+          @click="openJevSettings"
+        >
+          Jev 设置
+        </button>
+        <button
+          type="button"
+          class="min-h-11 px-3 rounded-lg border border-[var(--border-default)] text-sm hover:bg-[var(--surface-subtle)] whitespace-nowrap"
           @click="rulesOpen = true"
         >
           规则
@@ -349,10 +437,33 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
             />
           </div>
 
-          <!-- Jev 暂停：明确状态与重试入口（只恢复后续决策） -->
-          <div v-if="session.aiTurn.jevPaused.value" class="flex justify-center">
-            <AiPauseNotice @retry="session.aiTurn.resumeJev()" />
+          <!-- Jev 暂停：明确状态与重试入口（只恢复后续决策）；补充配置个人 Key 入口 -->
+          <div v-if="showSitePauseNotice" class="flex justify-center">
+            <AiPauseNotice @retry="session.aiTurn.resumeJev()" @open-settings="openJevSettings" />
           </div>
+          <div v-else-if="showPersonalUnavailableNotice" class="flex justify-center">
+            <AiPauseNotice reason="服务端配置异常" @retry="session.aiTurn.resumeJev()" @open-settings="openJevSettings" />
+          </div>
+
+          <!-- 凭据提示条：持续可见，不随回合重复弹出；确认后仍有逐回合来源标识 -->
+          <JevKeyNotice
+            v-if="showQuotaNotice"
+            variant="quota"
+            @use-own-key="useOwnKeyFromNotice"
+            @dismiss="quotaNoticeDismissed = true"
+          />
+          <JevKeyNotice
+            v-else-if="showRejectedNotice"
+            variant="rejected"
+            @use-own-key="useOwnKeyFromNotice"
+            @dismiss="rejectedDismissal.dismiss()"
+          />
+          <JevKeyNotice
+            v-else-if="showMissingNotice"
+            variant="missing"
+            @use-own-key="useOwnKeyFromNotice"
+            @use-site-quota="onSetJevSource('site')"
+          />
 
           <GameTable
             :state="state"
@@ -444,13 +555,28 @@ useHead({ title: 'UnoJev — 与 Jev 一起玩 UNO' })
       </ClientOnly>
     </main>
 
-    <footer class="px-4 py-3 pb-[calc(env(safe-area-inset-bottom,0px)+0.75rem)] text-xs text-[var(--text-muted)] border-t border-[var(--border-subtle)] flex justify-between gap-2 whitespace-nowrap">
+    <footer class="px-4 py-3 pb-[calc(env(safe-area-inset-bottom,0px)+0.75rem)] text-xs text-[var(--text-muted)] border-t border-[var(--border-subtle)] flex flex-wrap justify-between gap-x-2 gap-y-1">
       <span>对局数据仅保存在本浏览器</span>
-      <span>Jev 决策经同源服务代理</span>
+      <span>Jev 决策：{{ jevSourceLabel }}（经本站服务端调用）</span>
     </footer>
 
     <!-- 规则说明 -->
     <RulesDialog v-model="rulesOpen" />
+
+    <!-- Jev 设置：来源选择与个人 Key 管理 -->
+    <JevKeySettings
+      v-model="jevSettingsOpen"
+      :source="jev.source.value"
+      :has-key="jev.hasPersonalKey.value"
+      :remember-key="jev.rememberKey.value"
+      :storage-unavailable="jev.storageUnavailable.value"
+      :persist-problem="jev.persistProblem.value"
+      @set-source="onSetJevSource"
+      @save-key="onSaveJevKey"
+      @set-remember="onSetJevRemember"
+      @delete-key="onDeleteJevKey"
+      @retry-persist="onRetryJevPersist"
+    />
 
     <!-- 新局确认 -->
     <Teleport to="body">
