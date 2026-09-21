@@ -63,7 +63,7 @@ interface Submitted {
   meta: { aiSource: string, fallbackReason?: string } | undefined
 }
 
-function mountAiTurn(initial: GameState) {
+function mountAiTurn(initial: GameState, credential = { source: 'site' as const, personalKey: null as string | null }) {
   const stateRef = { current: initial }
   const submitted: Submitted[] = []
   const fetchCalls: Array<{ url: string, body: unknown }> = []
@@ -72,6 +72,7 @@ function mountAiTurn(initial: GameState) {
   const deps = {
     getState: () => stateRef.current,
     canAdvance: () => canAdvanceValue,
+    getCredential: () => credential,
     submitAction: (actorId: string, action: LegalAction, meta: { aiSource: 'jev' | 'forced' | 'fallback', fallbackReason?: string }) => {
       submitted.push({ actorId, action, meta })
       const result = applyAction(stateRef.current, { actorId: actorId as GameState['currentPlayerId'], gameId: stateRef.current.gameId, expectedRevision: stateRef.current.revision, action }, meta ? { meta: { aiSource: meta.aiSource, ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}) } } : undefined)
@@ -137,7 +138,7 @@ describe('aI 决策调度（A3 客户端）', () => {
     const candidates = enumerateCandidatesFromState(state)!
     const harness = mountAiTurn(state)
     const { impl, calls } = queueResponses([jsonResponse(200, {
-      protocolVersion: 1,
+      protocolVersion: 2,
       gameId: state.gameId,
       revision: state.revision,
       decisionId: 'PLACEHOLDER',
@@ -154,7 +155,7 @@ describe('aI 决策调度（A3 客户端）', () => {
       harness.fetchCalls.push({ url: String(url), body })
       const parsed = JSON.parse(String(init?.body))
       const responder = jsonResponse(200, {
-        protocolVersion: 1,
+        protocolVersion: 2,
         gameId: parsed.gameId,
         revision: parsed.revision,
         decisionId: parsed.decisionId,
@@ -176,7 +177,7 @@ describe('aI 决策调度（A3 客户端）', () => {
     expect(harness.fetchCalls[0]!.url).toBe('/api/ai/decision')
     // 请求体合同
     const body = harness.fetchCalls[0]!.body as Record<string, unknown>
-    expect(body.protocolVersion).toBe(1)
+    expect(body.protocolVersion).toBe(2)
     expect(body.gameId).toBe(state.gameId)
     expect(body.decisionId).toBe(latestDecisionId)
     expect(body.view).toEqual(projectForAi(state, state.currentPlayerId as 'p1'))
@@ -322,7 +323,7 @@ describe('aI 决策调度（A3 客户端）', () => {
     const body = harness.fetchCalls[0]!.body as { decisionId: string, gameId: string, revision: number, actorId: string }
     const candidatesBefore = enumerateCandidatesFromState(state)!
     releaseResponse(new Response(JSON.stringify({
-      protocolVersion: 1,
+      protocolVersion: 2,
       gameId: body.gameId,
       revision: body.revision,
       decisionId: body.decisionId,
@@ -357,7 +358,7 @@ describe('aI 决策调度（A3 客户端）', () => {
     const body = harness.fetchCalls[0]!.body as { decisionId: string, gameId: string, revision: number, actorId: string }
     const candidatesBefore = enumerateCandidatesFromState(state)!
     releaseFirst(new Response(JSON.stringify({
-      protocolVersion: 1,
+      protocolVersion: 2,
       gameId: body.gameId,
       revision: body.revision,
       decisionId: body.decisionId,
@@ -425,7 +426,7 @@ describe('aI 决策调度（A3 客户端）', () => {
         harness.fetchCalls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null })
         const parsed = JSON.parse(String(init?.body))
         return new Response(JSON.stringify({
-          protocolVersion: 1,
+          protocolVersion: 2,
           gameId: parsed.gameId,
           revision: parsed.revision,
           decisionId: parsed.decisionId,

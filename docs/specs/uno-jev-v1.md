@@ -2,7 +2,7 @@
 
 状态：产品方向已确认，可据此进入实现；文中标明的 v1 默认值是本次补齐的实施选择。游戏、真实 Jev 调用和部署均未实施。
 
-核对日期：2026-09-19。产品名为 **UnoJev**，GitHub 仓库名为 `uno-jev`。本文件维护 v1 行为与接口合同，README 和文档索引只提供概览与入口。
+核对日期：2026-09-19（v1 基线）；2026-09-20 增补"使用自己的 Jev API Key"（凭据来源、个人 Key 传递与额度引导），并重新核对 TypeSafe 错误语义；2026-09-21 细化凭据持久化的保存意图检查与清除重试判定目标。产品名为 **UnoJev**，GitHub 仓库名为 `uno-jev`。本文件维护 v1 行为与接口合同，README 和文档索引只提供概览与入口。
 
 ## 范围与非目标
 
@@ -147,7 +147,8 @@ type LegalAction =
 | 纯 TypeScript 规则层 | 牌组、洗牌、发牌、合法动作、回合、功能牌、UNO、胜负；不通过网络执行规则。 |
 | `useUnoGame` | 持有唯一当前状态，串行提交命令，派生 UI 数据，连接规则与持久化；页面组件不重复实现规则。 |
 | `useGamePersistence` | 用 VueUse `useLocalStorage` 保存和恢复快照，校验版本、处理写入失败和多标签页控制权。 |
-| `useAiTurn` | 生成当前 AI 视角，调度一次决策，校验过期响应，执行规则策略兜底并标记来源。 |
+| `useAiTurn` | 生成当前 AI 视角，调度一次决策，校验过期响应，执行规则策略兜底并标记来源；按凭据来源区分暂停与冷却，处理额度粘滞与 Key 缺失兜底。 |
+| `useJevCredentials` | 站点额度 / 个人 Key 的来源选择、Key 的内存与持久化保存；Key 不进入存档、事件、URL 或日志。 |
 | 偏好 / 主题 composable | `useLocalStorage` 管理设置，`useColorMode` 管理实际主题，使用 `@vueuse/core` 的明确导入，避免与 Nitro `useStorage` 混淆。 |
 | 展示组件 | 桌面牌桌、真人手牌、对手摘要、回合操作和选色面板；接收 props、发出动作意图，不直接修改手牌或存档。 |
 | Worker / Nuxt API | 校验受限请求，在服务端构造 Choice，调用 Jev 并规范化返回；不保存对局、不安排下一回合。 |
@@ -197,8 +198,10 @@ ID 由动作内容生成，例如 `draw_one`、`keep_drawn`、`opening_color_red
 
 ```ts
 interface AiDecisionRequest {
-  protocolVersion: 1
+  protocolVersion: 2
   rulesVersion: 'classic-single-v1'
+  /** 本次决策使用的凭据来源；personal 时必须携带专用请求头。 */
+  credentialSource: 'site' | 'personal'
   gameId: string
   revision: number
   decisionId: string
@@ -208,7 +211,7 @@ interface AiDecisionRequest {
 }
 
 interface AiDecisionResponse {
-  protocolVersion: 1
+  protocolVersion: 2
   gameId: string
   revision: number
   decisionId: string
@@ -221,13 +224,29 @@ interface AiDecisionResponse {
 
 `decisionId` 为每次请求的新 UUID，仅当前页面内存记录它与请求快照的对应关系；不放进对局存档。服务端回显通过验证的关联字段，`model` 取上游实际响应值。成功响应只包含选中 ID 与诊断用模型名，不包含新游戏状态、API key、整份上游响应或伪造的推理过程。返回 `Cache-Control: no-store`。
 
+#### 凭据来源与个人 Key 传递
+
+协议用 `credentialSource` 显式指定本次决策使用的凭据，两个来源的密钥边界严格区分：
+
+| 来源 | 密钥内容 | 传递与存储约束 |
+|---|---|---|
+| `site`（默认） | 站点密钥 `NUXT_TYPESAFE_API_KEY` | 仅服务端 runtimeConfig 读取，始终留在服务端；请求不得携带个人 Key 头，携带即按 `400 invalid_request` 拒绝（来源矛盾）。 |
+| `personal` | 用户主动提供的个人 Key | 仅经同源 HTTPS 请求的专用请求头 `x-unojev-personal-key` 传递；Worker 只在当前请求内使用，不写入服务端存储、全局变量或缓存，也不进入日志。请求头缺失或格式非法（非 1..256 个可打印 ASCII 字符）按 `400 invalid_request` 拒绝。 |
+
+- `personal` 请求缺 Key 或调用失败时，Worker 不回退站点密钥，也不自动轮换 Key 重试；每决策仍最多一次上游请求。
+- 上游地址、模型与决策内容始终由服务端约束；Origin 校验与全部请求校验对两种来源一致。
+- 个人 Key 的浏览器侧保存方式见“浏览器持久化”；Key 不进入游戏存档、公开事件、SSR 页面数据、URL、日志、分析事件或错误响应。
+- 站点额度耗尽的判定只能由运营者显式配置声明（`NUXT_TYPESAFE_SITE_QUOTA_EXHAUSTED`），不得从上游错误猜测，详见“超时、兜底与过期响应”。
+
 Worker 限定 POST、JSON 和本站 Origin，拒绝未知字段，检查所有字段的类型、长度和枚举；请求体上限默认 64 KiB，手牌与弃牌 ID 必须有效且互斥，数量与候选必须符合该阶段。`gameId` / `decisionId` 为标准 36 字符 UUID，revision 为非负安全整数，候选数为 `2..133`，候选 ID 为至多 128 字符的 ASCII 标识；牌 ID 必须直接命中固定目录。用户不能通过额外字段让端点变成通用 TypeSafe 代理；Origin 检查不视为身份认证或可靠的付费防滥用措施。
 
 ### TypeSafe 适配
 
-采用 [Choice primitive](https://docs.typesafe.ai/primitives/choice)，通过 Worker 的标准 `fetch` 调用 [HTTP API](https://docs.typesafe.ai/api)：`POST https://api.typesafe.ai/v1/systemone`，使用服务端 `Authorization: Bearer <API_KEY>`。v1 默认直接使用 HTTP，避免 SDK 隐含重试改变回合预算。
+采用 [Choice primitive](https://docs.typesafe.ai/primitives/choice)，通过 Worker 的标准 `fetch` 调用 [HTTP API](https://docs.typesafe.ai/api)：`POST https://api.typesafe.ai/v1/systemone`，使用服务端 `Authorization: Bearer <API_KEY>`（凭据来源决定 Key 内容：站点密钥或当次请求的个人 Key）。v1 默认直接使用 HTTP，避免 SDK 隐含重试改变回合预算。
 
 上游 payload 固定为 `{ model, state, questions }`：`state` 只放经过投影的 AI 视角；`questions.choose_action` 为 `{ type: 'choice', instructions, criteria }`，`criteria` 将每个稳定候选 ID 映射到代码生成的动作描述，包括牌面、选色、宣告及确定的规则效果。服务端固定英文指令要求“只根据可见信息，选择一个候选动作，目标是先出完自己的手牌”，不让模型制定规则或假定知道暗牌。中文 UI 与英文模型指令分开维护。
+
+2026-09-20 核对的 [API 错误表](https://docs.typesafe.ai/api#errors)只定义了四类错误：`401 Unauthorized`（Key 缺失或无效）、`422 Unprocessable Entity`（请求体校验失败）、`429 Too Many Requests`（调用方超出速率限制，稍候重试）、`529 Overloaded`（TypeSafe 暂时过载，稍候重试）；错误响应体的结构未在文档中定义。**官方 API 没有任何可区分“额度耗尽”的错误码**，也不提供余额查询接口；因此本站不得把 429、529 或鉴权错误说成额度耗尽，也不得根据调用次数猜测余额。站点额度耗尽只能由运营者显式配置声明（见下文）；个人 Key 的 401/403 归属用户自己的 Key，429 归属其账户的速率限制，529 归属 TypeSafe 服务方。官方 Key 获取入口为 [TypeSafe 控制台](https://console.typesafe.ai/keys)（quickstart 明确指向）。实现或部署时应再次核对文档是否新增了额度信号，并同步本节。
 
 从 `answers.choose_action.choice` 读取 ID，验证 `type === 'choice'`、选项确实存在，以及模型字段和返回结构有效。若返回的概率 / confidence 字段缺失、不是有限数值或超出 `0..1`，按无效上游结构处理；概率键应恰好覆盖候选，总和与 1 的误差不超过 `1e-6`。默认不把这些数值传给 UI，不因低 confidence 自行改为兜底，也不将其称为胜率。Choice 的概率比较候选选项，confidence 描述分布集中程度，均不是 UNO 对局胜率。
 
@@ -237,20 +256,28 @@ Worker 限定 POST、JSON 和本站 Origin，拒绝未知字段，检查所有�
 
 Worker 每次上游调用默认 6 秒超时，浏览器同源请求默认总计 8 秒超时；这两个数是产品等待预算，不是已测性能。每个决策最多一次上游请求，同一页面最多一个在途决策，不为三个 AI 并发预请求，不对同一 revision 自动重试。抽到可出牌后进入新 revision，可以再请求一次新的抽后决策。
 
+**暂停与冷却按凭据来源分别记录**：站点来源的暂停 / 冷却不影响个人 Key 的请求，反之亦然；替换或删除个人 Key 后清除个人来源的暂停与冷却（它们针对旧 Key）。凭据变更（保存 / 替换 / 删除 Key、切换来源）时取消并作废旧请求，旧请求的成功与失败都不影响新配置，随后按当前对局状态恢复尚未完成的决策，不重放已落地的兜底动作。
+
 | 情况 | 对外错误 / 客户端行为 |
 |---|---|
 | 请求格式或候选不符合合同 | `400 invalid_request`，不调用上游；客户端重新验证当前状态与合法动作，通过则当次兜底，否则暂停并显示规则错误，合同错误进入开发诊断。 |
 | 外站 Origin | `403 forbidden_origin`，不调用上游。 |
-| 本站边缘限流或上游 `429/529` | `429 ai_rate_limited`，当次由规则策略执行；客户端至少冷却 30 秒，若有有效且更长的 `Retry-After` 则采用它。冷却期的各次 AI 行动均标明兜底。 |
-| 服务端缺少 key、上游 `401/403` | `503 ai_unavailable`，当次兜底，本页面会话暂停 Jev 请求，提供“重试 AI”入口，只恢复后续决策，不重放已落地动作。 |
+| `credentialSource: personal` 缺少或携带非法专用请求头；`site` 却携带个人 Key 头 | `400 invalid_request`，不调用上游；客户端不回退站点额度，按缺 Key 处理（见下）。 |
+| 本站边缘限流或上游 `429` | `429 ai_rate_limited`，当次由规则策略执行；客户端**按请求使用的凭据来源**冷却至少 30 秒，若有有效且更长的 `Retry-After` 则采用它。冷却期的各次 AI 行动均标明兜底。 |
+| 上游 `529` | `503 ai_overloaded`（区别于 429 的调用方限流），当次兜底并记录 `service_overloaded`；仅在上游给出有效 `Retry-After` 时按该来源冷却，否则下一个决策可再尝试。 |
+| 站点额度确认耗尽（运营者显式配置 `NUXT_TYPESAFE_SITE_QUOTA_EXHAUSTED=true`，仅站点来源生效） | `503 ai_site_quota_exhausted`，不调用上游；客户端进入会话内粘滞状态并显示持续可见的引导（“使用自己的 Key” / “继续使用规则对手”与官方 Key 链接），保留当前对局；无法调用 Jev 的回合继续用规则策略并保留来源标识，不重复弹提示。个人 Key 请求不受该开关影响。 |
+| 服务端缺少站点 key / 模型配置 | `503 ai_unavailable`，当次兜底，本页面会话暂停**对应来源**的 Jev 请求，提供“重试 AI”入口，只恢复后续决策，不重放已落地动作。 |
+| 上游 `401/403`（站点密钥） | `503 ai_unavailable`，行为同上；站点密钥问题不得说成用户的 Key 问题。 |
+| 上游 `401/403`（个人 Key） | `503 ai_key_rejected`，问题明确归属用户自己的 Key（无效或无权限）；客户端暂停个人来源、显示修改 Key 入口，兜底记录 `personal_key_rejected`，不与站点额度混淆。 |
+| 个人模式缺少 Key（未输入即选择个人来源） | 不发请求，不消耗站点额度，兜底记录 `personal_key_missing`；界面持续提示输入 Key 或改回站点额度。 |
 | 上游 `422`、其他错误或返回不符合合同 | `502 ai_invalid_response` / `ai_upstream_error`，当次兜底，下一个决策可再尝试。 |
 | Worker 超时 | `504 ai_timeout`，当次兜底。 |
 | 浏览器网络错误、8 秒到期 | 取消请求，当次兜底；离线期间直接兜底，恢复网络后的新决策再尝试。 |
 | 旧请求、重复响应、已换局或已失去控制权 | 丢弃，不执行，也不触发该旧请求的兜底。 |
 
-错误响应仅给稳定的 `{ error: { code }, decisionId? }` 与必要的 `Retry-After`；不透传上游响应体、请求头、堆栈或配置。即使错误页不是 JSON，客户端也能按网络 / HTTP 失败处理。取消请求不能保证上游尚未计费，不承诺端到端恰好一次调用。
+错误响应仅给稳定的 `{ error: { code }, decisionId? }` 与必要的 `Retry-After`；不透传上游响应体、请求头、堆栈或配置（包括任何 Key 值）。即使错误页不是 JSON，客户端也能按网络 / HTTP 失败处理。取消请求不能保证上游尚未计费，不承诺端到端恰好一次调用。缺乏可靠的额度信号时（如上游 429/529/鉴权错误），站点侧文案使用“站点 Jev 暂时不可用，可配置自己的 Key”等中性表述，不声称额度耗尽；只有运营者显式声明才使用额度耗尽文案。
 
-应用响应前，必须同时满足：仍持有本页写权限，页面处于可推进状态，`decisionId` 仍为唯一在途请求，`gameId`、`revision`、行动者和阶段与请求快照一致。随后以**当前状态重新枚举**合法动作，用 ID 查找，并交给引擎验证。先使本请求失效，再提交一次动作；晚到的成功或失败均无权覆盖结果。新局、刷新恢复、页面隐藏、存档冲突和会话销毁都会取消并作废在途请求。
+应用响应前，必须同时满足：仍持有本页写权限，页面处于可推进状态，`decisionId` 仍为唯一在途请求，`gameId`、`revision`、行动者和阶段与请求快照一致。随后以**当前状态重新枚举**合法动作，用 ID 查找，并交给引擎验证。先使本请求失效，再提交一次动作；晚到的成功或失败均无权覆盖结果。新局、刷新恢复、页面隐藏、存档冲突、会话销毁与凭据变更都会取消并作废在途请求。
 
 规则兜底只接收同一 `AiView` 和当前合法候选，不能读取暗牌。固定排序策略为：能立即出完的动作优先；否则优先出牌，按“出牌后该颜色的剩余手牌数降序、牌类 `+4 > +2 > Skip > Reverse > 数字 > Wild`、数字降序、颜色红黄绿蓝、CardId 字典序”打破平局。Wild 的选色按剩余有色手牌数最多优先，平局仍按固定颜色顺序；开局选色同理。无可出牌时选抽牌，抽后只在没有可出候选时保留。策略不调用随机数，相同输入必得相同结果。
 
@@ -287,6 +314,19 @@ interface SaveEnvelopeV1 {
 
 主题意图单独保存在 `unojev:theme`，取值 `auto/light/dark`；其他偏好保存在 `unojev:settings`，格式为 `{ schemaVersion: 1, reducedMotion: 'system' | 'reduce', revealHands: boolean }`，默认减少动态跟随 `system`、明牌模式关闭。旧设置缺少 `revealHands` 或值非法时按 `false` 读取，无需迁移游戏存档。各偏好独立更新，设置可在各标签页同步，非法偏好值回退默认值；这不适用于游戏快照的严格校验。
 
+个人 Jev Key 保存在独立的存储项 `unojev:jev-key`，凭据格式为 `{ schemaVersion: 1, source: 'site' | 'personal', key: string }`；默认不写入——只在用户勾选“在此设备记住”且已配置 Key 时整体写入，取消记住时移除该存储项。默认（未记住）时个人 Key 只保留在当前页面内存，刷新后需重新输入。存储内容非法时按不存在处理（默认站点额度），不覆盖原槽位。Key 保存在当前浏览器本地（不加密、不宣称绝对安全），不保存到本站服务器；调用时经本站服务端转发到 TypeSafe。存储不可用时退回内存模式并提示。Key 不得进入游戏存档（`unojev:save`）、公开事件、SSR 页面数据、URL、日志、分析事件或错误响应；删除 Key 同时清除内存与持久化副本并回到默认的站点额度来源。
+
+**删除标记与跨标签页一致性**：删除 Key 时持久化副本被替换为墓碑标记 `{ schemaVersion: 1, deleted: true }`（不含 Key），使其他标签页能区分“删除”与“取消记住”（后者仅移除条目，Key 留在各页内存）；加载时墓碑按无记住 Key 处理。存储项是“已记住凭据”的唯一共享事实来源，页面通过 storage 事件同步，并在每次写入前与最近已知值比较（CAS）：
+
+- 已记住且无本地新编辑的页面镜像最新存储值（含来源）；旧页面不得复活已删除的 Key，也不得用旧 Key 覆盖另一页面刚保存的新 Key（写前比较先采纳外部值，再应用本页的来源意图）。
+- 本页未持久化的新 Key（输入或替换后写入失败 / 未记住）保持独立，不被外部同步覆盖；随后按本页最新意图写入。
+- “切换来源 / 保存 Key 附带的持久化”与“用户显式勾选记住”区分：每次实际保存前（含重试路径，无论存储基线是否变化）检查当前有效的保存意图——外部取消记住经 storage 事件或写前同步生效后，过期的保存意图不再把 Key 写回，待重试操作与提示一并清除（旧标签页的来源切换不能撤销另一页已同步的取消记住）；用户显式勾选记住（勾选当时 rememberKey 为真）的意图仍优先并正常保存。
+- 清除意图在创建时记录判定目标：本次操作针对的页内 Key + 本页自己的存储基线副本（origin 为 own，如替换写入失败遗留的旧 Key——清除它正是操作目的；读取故障期间存储实际仍可能是该副本）。首次执行与重试共用同一判定：判定目标之内照常清除并同步墓碑（外部仅改变同一 Key 的来源同样属于目标之内）；判定目标之外的新 Key（外部新保存，或重试期间被外部替换）不得误删、不得虚报清除成功，以冲突状态如实表达（无可重试动作）。存储已是墓碑时，取消记住不得移除墓碑（不把删除降级为取消记住）。
+- 外部删除（墓碑）到达时同步清空页内 Key；外部取消记住（移除）到达时 Key 留在页内并转为未记住。历史缓存（bfcache）恢复时主动重同步。
+- 同步导致当前有效凭据变化时走既有流程：取消并作废在途请求、按当前对局状态重新调度，已落地的兜底动作不重放。
+
+**持久化失败的状态区分**：保存 / 替换 Key 时页内立即生效，写入本地存储失败不阻塞使用，但以明确状态区分“本页已生效”与“持久化结果”——旧副本是否残留（替换失败时刷新会恢复旧 Key 而不是新 Key）必须如实提示，不得宣称已删除或只剩内存副本；删除 / 取消记住的清除失败同样提示刷新仍会恢复该 Key。读取失败不代表持久化副本不存在：保留未完成的具体操作意图（保存 / 取消记住 / 删除及判定目标，不由当前页内状态反推），结果未知时如实提示（旧副本可能仍在），恢复访问后按意图重试，成功后同时更新问题与可用状态；新的用户操作以自身意图覆盖旧意图，清除重试以创建意图时的判定目标核对存储，过期意图不得误删外部新凭据。可重试的问题提供入口，冲突（外部新 Key 未受影响）没有可重试动作；已完成的操作重复重试无动作。存在持久化问题时不再同时显示“仅本页内存”等可能矛盾的说明；只有 localStorage 不可访问（隐私模式 / 被禁用）且无更具体问题才进入“仅本页内存”模式提示。
+
 ### 多标签页与冲突
 
 v1 使用同源 [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API)的独占锁 `unojev:active-game`。控制页在对局会话期间持有锁；其他页显示只读快照和“对局正在另一标签页中进行”，不能发起 AI、修改存档、清除或开始新局。设置不受此锁限制。旧页关闭或主动释放后，另一页可通过“在此页继续”重新争取锁，重新读档再行动；不实现抢占或强制接管。
@@ -318,7 +358,7 @@ Tailwind CSS 4 按 [官方 Nuxt 接入指南](https://tailwindcss.com/docs/insta
 
 ### 对局体验
 
-入口提供新局和有效存档的继续入口，规则摘要明确显示单局、无叠加、严格 `+4`、AI 自动抓漏。正在进行的对局展示真人完整手牌、三个对手的牌背 / 数量、弃牌堆顶牌、当前颜色、方向、轮到谁和最近动作。牌桌提供可随时切换的“明牌模式”：开启后显示三个对手的完整手牌，大量手牌可在各自区域滚动查看；关闭后恢复牌背与数量，不渲染暗牌牌面标签。明牌是仅供真人查看的本地展示偏好，不进入游戏快照，也不改变 Jev 的信息投影、请求内容或合法动作。结束页给出胜者或和局原因，以及再来一局的操作。
+入口提供新局和有效存档的继续入口，规则摘要明确显示单局、无叠加、严格 `+4`、AI 自动抓漏。顶栏在首页与对局中提供“Jev 设置”入口（设置不受游戏锁限制）：默认“使用站点额度”，可选“使用自己的 Key”；输入框默认隐藏 Key 内容，支持显示、替换与删除，明确显示当前使用的来源。设置弹窗支持完整键盘操作：打开时焦点进入弹窗、Tab / Shift+Tab 在弹窗内循环、Escape 关闭并恢复焦点到触发入口，打开期间背景通过原生 `inert` 不可交互。选择个人 Key 后三位 Jev 对手都使用该 Key，界面说明调用费用由用户自己的 TypeSafe 账户承担，并提供经核实的 TypeSafe 官方 Key 获取链接；打开设置或输入 Key 时不自动发起收费的验证请求。站点额度确认耗尽时显示持续可见的引导提示（见“超时、兜底与过期响应”），保留当前对局，不强制重开；Key 被拒 / 缺 Key 的提示确认状态绑定到当前 Key 版本——同一 Key 的连续失败不逐回合重复打扰，替换或删除 Key 后新 Key 的失败会重新显示原因与修改入口。正在进行的对局展示真人完整手牌、三个对手的牌背 / 数量、弃牌堆顶牌、当前颜色、方向、轮到谁和最近动作。牌桌提供可随时切换的“明牌模式”：开启后显示三个对手的完整手牌，大量手牌可在各自区域滚动查看；关闭后恢复牌背与数量，不渲染暗牌牌面标签。明牌是仅供真人查看的本地展示偏好，不进入游戏快照，也不改变 Jev 的信息投影、请求内容或合法动作。结束页给出胜者或和局原因，以及再来一局的操作。
 
 物理座位固定为 `p0` 在下方、`p1` 在左手、`p2` 在上方对家、`p3` 在右手；`direction = 1` 对应顺时针，反向为逆时针，反转牌不移动座位。各座位展示最近公开事件中的上次出牌及 Wild 选色，记录不在最近 50 条事件中时显示“暂无出牌记录”。这些是历史展示，不是独立弃牌堆；中央共用弃牌堆顶牌仍是下一次匹配的依据，并在有对应公开记录时标明出牌者。
 
@@ -330,11 +370,13 @@ Tailwind CSS 4 按 [官方 Nuxt 接入指南](https://tailwindcss.com/docs/insta
 
 ## 本地配置与部署
 
-以下仅为后续实现示例，不表示已有配置文件或可以启动应用。根目录 `.env` 约定为：
+根目录 `.env` 约定为：
 
 ```dotenv
 NUXT_TYPESAFE_API_KEY=
 NUXT_TYPESAFE_MODEL=jev-1.13.0
+# 站点额度已确认耗尽时设为 true（仅影响站点来源；个人 Key 请求不受影响）
+NUXT_TYPESAFE_SITE_QUOTA_EXHAUSTED=false
 ```
 
 已有本地密钥不应被覆盖、复制到文档 worktree 或提交。核对时原工作目录的 `.env` 已存在且被 `.gitignore` 中的 `.env` / `.env.*` 规则忽略，`.env.example` 为例外；独立 worktree 不保证包含尚未提交的忽略文件。实际开发环境须在放入密钥前确认忽略规则，可用 `git check-ignore -v .env`，不输出密钥值。可提交的 `.env.example` 只保留空密钥占位。
@@ -346,15 +388,17 @@ export default defineNuxtConfig({
   runtimeConfig: {
     typesafeApiKey: '',
     typesafeModel: 'jev-1.13.0',
+    // 站点额度已确认耗尽（'true' 生效）；这是运营者的显式声明，不是从上游错误推断的
+    typesafeSiteQuotaExhausted: false,
   },
 })
 ```
 
-server route 用 `useRuntimeConfig(event)` 读取私有字段，通过匹配的 `NUXT_TYPESAFE_API_KEY` 和 `NUXT_TYPESAFE_MODEL` 在运行时注入。不要把真实 key 写成配置默认值、放入 `public` / `app` runtime config、Vite define、客户端 bundle、SSR payload、storage、日志或请求响应。此处“请求响应”指浏览器与本站 API；Worker 到 TypeSafe 的认证请求头是唯一允许携带 key 的业务网络出口。
+server route 用 `useRuntimeConfig(event)` 读取私有字段，通过匹配的 `NUXT_TYPESAFE_API_KEY`、`NUXT_TYPESAFE_MODEL` 和 `NUXT_TYPESAFE_SITE_QUOTA_EXHAUSTED` 在运行时注入。不要把真实 key 写成配置默认值、放入 `public` / `app` runtime config、Vite define、客户端 bundle、SSR payload、storage、日志或请求响应。此处“请求响应”指浏览器与本站 API；Worker 到 TypeSafe 的认证请求头是唯一允许携带站点 key 的业务网络出口，个人 Key 的专用请求头（浏览器 → 本站 Worker）与上游认证头（Worker → TypeSafe）是它唯一经过本站服务端的路径，且仅限当次请求。
 
-生产使用 [Cloudflare Worker Secret](https://developers.cloudflare.com/workers/configuration/secrets/)配置 `NUXT_TYPESAFE_API_KEY`；模型名是普通服务端配置。生产 Worker 不依赖本地 `.env` 文件，也不把 key 放进 `wrangler.jsonc` 的公开 `vars`。依据 [Cloudflare Nuxt Workers 指南](https://developers.cloudflare.com/workers/framework-guides/web-apps/more-web-frameworks/nuxt/)选择与实际 Nuxt / Nitro 版本匹配的适配配置；当前指南使用 `cloudflare` preset 与 Workers Assets，不是纯静态导出后直接访问 TypeSafe。
+生产使用 [Cloudflare Worker Secret](https://developers.cloudflare.com/workers/configuration/secrets/)配置 `NUXT_TYPESAFE_API_KEY`；模型名与额度开关是普通服务端配置（额度开关也可用 `wrangler secret put` 或环境变量注入）。生产 Worker 不依赖本地 `.env` 文件，也不把 key 放进 `wrangler.jsonc` 的公开 `vars`。依据 [Cloudflare Nuxt Workers 指南](https://developers.cloudflare.com/workers/framework-guides/web-apps/more-web-frameworks/nuxt/)选择与实际 Nuxt / Nitro 版本匹配的适配配置；当前指南使用 `cloudflare` preset 与 Workers Assets，不是纯静态导出后直接访问 TypeSafe。
 
-SSR 只输出外壳和非对局内容；发牌、storage 访问及 AI 调度在客户端初始化之后进行。Worker 不保留游戏快照、会话房间或玩家身份。日志只允许错误码、耗时、模型名、请求关联 ID 和 token 数等必要诊断，不打印 Authorization、完整 runtimeConfig、上游原始错误或完整手牌 payload。公开部署时在 Cloudflare 边缘配置端点限流，并验证超限也能按兜底流程继续。
+SSR 只输出外壳和非对局内容；发牌、storage 访问及 AI 调度在客户端初始化之后进行。Worker 不保留游戏快照、会话房间、玩家身份或个人 Key。日志只允许错误码、耗时、模型名、凭据来源、请求关联 ID 和 token 数等必要诊断，不打印 Authorization、任何 Key 值、完整 runtimeConfig、上游原始错误或完整手牌 payload。公开部署时在 Cloudflare 边缘配置端点限流，并验证超限也能按兜底流程继续。
 
 ## 验收标准与测试计划
 
@@ -378,6 +422,17 @@ SSR 只输出外壳和非对局内容；发牌、storage 访问及 AI 调度在�
 | A3 | Mock 成功、429、529、401、422、5xx、非 JSON、字段缺失、非法数值、6/8 秒超时、断网、重复及乱序返回；该兜底时只执行一次，过期时既不执行也不兜底。 |
 | A4 | 相同视角得到相同兜底动作；每次兜底 / forced 来源明确；重开、刷新、隐藏或失去控制权后旧响应无效。 |
 | A5 | 使用假的密钥标记检查客户端 bundle、SSR payload、浏览器存储与网络响应不含它；Worker 运行时可读取私有配置，缺配置走受控错误。 |
+| K1 | 来源选择：默认站点额度；`credentialSource` 与专用请求头一致传递；个人模式的上游 Authorization 使用个人 Key、不使用站点密钥；Key 不进入请求体。 |
+| K2 | 个人模式约束：缺 Key 不发请求且不改用站点额度（`personal_key_missing` 兜底）；`personal` 缺头 / 非法头与 `site` 携带头均 `400`；不自动轮换 Key 重试。 |
+| K3 | 错误识别区分：429 → 限流（按来源冷却）、529 → 过载（`service_overloaded`，无 Retry-After 不冷却）、401/403 个人 → `ai_key_rejected`（归属用户自己的 Key）、401/403 站点 → `ai_unavailable`；均不得说成额度耗尽，也不按调用次数猜测余额。 |
+| K4 | 额度引导：仅运营者显式开关触发 `ai_site_quota_exhausted`（不调用上游、个人请求不受影响）；客户端显示持续可见的提示与“使用自己的 Key / 继续使用规则对手”操作和官方 Key 链接，不逐回合重复弹出，保留当前对局并继续规则兜底。 |
+| K5 | 切换与恢复：保存 / 替换 / 删除 Key 或切换来源时作废旧请求（晚到的成功与失败均不生效），按当前状态恢复未完成决策；暂停与冷却按来源区分，站点额度故障不阻止个人 Key；替换 Key 清除个人暂停与冷却；一次动作只提交一次。 |
+| K6 | 保存与删除：默认仅内存；勾选记住才写独立存储项 `unojev:jev-key`；取消记住删持久化副本；删除 Key 同时清内存与持久化并回到站点额度；非法持久化内容按默认处理；存储不可用退回内存并提示。 |
+| K7 | Key 隔离：假 Key 标记不进入游戏存档、公开事件、SSR 数据、URL、本站日志、上游请求体或错误响应；设置界面不自动发起收费验证请求。 |
+| K8 | 跨标签页一致性：两页恢复同一记住 Key 后，一页删除 / 替换 / 取消记住 / 切换来源，另一页通过 storage 事件与写前比较同步——不复活已删除的 Key、不用旧 Key 覆盖新保存的 Key、未记住的页内新 Key 保持独立；每次实际保存前（含重试）检查当前有效意图，附带保存不撤销外部取消记住（过期的待重试保存意图与提示在外部取消记住 / 删除生效后清除），显式勾选记住仍可保存；清除按判定目标判断（页内 Key + 本页基线副本，首次与重试一致：仅来源变化照常清除，本页遗留旧副本可清除，外部新 Key 冲突保护）；同步变化走既有请求失效与重调度；bfcache 恢复后重同步。 |
+| K9 | 持久化失败区分：已记住 Key A 时替换为 B 且写入失败——B 立即在本页生效，旧副本 A 仍在并被如实提示（刷新恢复 A），重试成功后更新；删除 / 取消记住清除失败同样提示并可重试；读取故障期间替换 B 后删除 / 取消记住——恢复访问后重试按判定目标清除本页遗留的 A，不误判为外部冲突；读取失败不代表副本不存在——保留具体操作意图与判定目标、如实提示结果未知、恢复访问后按意图重试且不误删外部新凭据、成功后更新问题与可用状态、重复重试无已完成 / 过期动作；不误称存储不可用或只剩内存副本。 |
+| K10 | 提示按 Key 版本管理：关闭 Key A 的“无法使用”提示后替换为 B，B 被拒时提示再次显示；同一 Key 的连续失败不重复打扰。 |
+| K11 | 弹窗键盘交互：打开时焦点进入弹窗、Tab / Shift+Tab 在弹窗内循环、Escape 关闭并恢复触发入口焦点、背景 inert 不可交互；不影响输入、保存与手机布局。 |
 | U1 | 至少覆盖 360 × 800 手机竖屏、800 × 360 横屏和 1440 × 900 桌面；大量手牌、选色和结算不遮挡关键操作，键盘与触控可完成一局。 |
 | U2 | Paper / Ink / 跟随系统及刷新持久化，首屏无错误主题闪烁；色彩之外有符号 / 文字、焦点可见、减少动态有效。 |
 | D1 | Nuxt 构建产物在 Worker 本地预览可提供页面与同源 API；无数据库绑定、无客户端直连 TypeSafe；错误日志和接口不泄露 key。 |

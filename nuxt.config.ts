@@ -18,6 +18,9 @@ export default defineNuxtConfig({
     // 私有配置：仅服务端读取，通过 NUXT_TYPESAFE_* 环境变量注入
     typesafeApiKey: '',
     typesafeModel: 'jev-1.13.0',
+    // 运营者显式声明站点额度已耗尽（'true' 生效）：
+    // TypeSafe API 无额度耗尽信号，只能由配置确认，站点来源请求返回受控错误
+    typesafeSiteQuotaExhausted: false,
   },
 
   // SSR 只输出外壳与非对局内容；发牌、storage 访问与 AI 调度在客户端初始化后进行

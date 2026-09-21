@@ -63,6 +63,7 @@ export class FakeStorage implements Storage {
   private map = new Map<string, string>()
   failSet = false
   failGet = false
+  failRemove = false
 
   get length() {
     return this.map.size
@@ -84,6 +85,9 @@ export class FakeStorage implements Storage {
   }
 
   removeItem(key: string): void {
+    if (this.failRemove) {
+      throw new DOMException('QuotaExceededError', 'QuotaExceededError')
+    }
     this.map.delete(key)
   }
 

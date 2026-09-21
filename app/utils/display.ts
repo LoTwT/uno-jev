@@ -73,8 +73,16 @@ export function fallbackReasonText(reason: FallbackReason): string {
       return '请求不符合合同'
     case 'rate_limited':
       return '限流冷却'
+    case 'service_overloaded':
+      return '服务过载'
     case 'ai_unavailable':
       return 'AI 暂不可用'
+    case 'site_quota_exhausted':
+      return '站点额度已用完'
+    case 'personal_key_missing':
+      return '未配置个人 Key'
+    case 'personal_key_rejected':
+      return '个人 Key 无效'
     case 'invalid_response':
       return '响应无效'
     case 'upstream_error':

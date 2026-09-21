@@ -1,9 +1,11 @@
-import { AI_REQUEST_BODY_LIMIT_BYTES } from '#shared/ai/protocol'
+import { AI_PERSONAL_KEY_HEADER, AI_REQUEST_BODY_LIMIT_BYTES } from '#shared/ai/protocol'
 /**
  * POST /api/ai/decision：同源 AI 决策代理。
  *
  * 路由只做 HTTP 适配（读取头与原始体、体积前置检查、回写状态），
  * 全部校验与上游调用逻辑在 server/utils/aiDecision.ts 中独立测试。
+ * 个人 Key 经专用请求头透传给处理核心：仅在当前请求内使用，
+ * 不写入服务端存储、全局变量或缓存，也不进入日志。
  */
 import { handleAiDecision } from '../../utils/aiDecision'
 
@@ -26,9 +28,11 @@ export default defineEventHandler(async (event) => {
     contentType: getRequestHeader(event, 'content-type') ?? null,
     contentLength: contentLengthHeader ?? null,
     bodyText,
+    personalKey: getRequestHeader(event, AI_PERSONAL_KEY_HEADER) ?? null,
     runtimeConfig: {
       typesafeApiKey: String(runtimeConfig.typesafeApiKey ?? ''),
       typesafeModel: String(runtimeConfig.typesafeModel ?? ''),
+      siteQuotaExhausted: String(runtimeConfig.typesafeSiteQuotaExhausted ?? '') === 'true',
     },
   })
 

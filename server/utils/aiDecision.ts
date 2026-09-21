@@ -17,6 +17,8 @@ import {
   AI_CANDIDATE_ID_PATTERN,
   AI_MAX_CANDIDATES,
   AI_MIN_CANDIDATES,
+  AI_PERSONAL_KEY_MAX_LENGTH,
+  AI_PERSONAL_KEY_PATTERN,
   AI_PROTOCOL_VERSION,
   AI_REQUEST_BODY_LIMIT_BYTES,
   AI_RULES_VERSION,
@@ -36,6 +38,8 @@ export interface AiDecisionLogEntry {
   /** 校验失败的字段级诊断（仅服务端日志，不进入响应体）。 */
   detail?: string
   durationMs: number
+  /** 本次请求使用的凭据来源（诊断用；不含任何密钥值）。 */
+  credentialSource?: 'site' | 'personal'
   /** 请求的模型名与上游实际响应的模型名。 */
   requestedModel?: string
   model?: string
@@ -52,7 +56,17 @@ export interface AiDecisionHandlerParams {
   contentType: string | null
   contentLength: string | null
   bodyText: string
-  runtimeConfig: { typesafeApiKey: string, typesafeModel: string }
+  /**
+   * 个人 Key（来自专用请求头）：仅当前请求内使用，不进入日志、存储或缓存；
+   * null 表示请求未携带。credentialSource 为 personal 时必须有效。
+   */
+  personalKey: string | null
+  runtimeConfig: {
+    typesafeApiKey: string
+    typesafeModel: string
+    /** 运营者显式确认站点额度耗尽（TypeSafe API 无额度信号，只能由配置声明）。 */
+    siteQuotaExhausted: boolean
+  }
   fetchImpl?: typeof fetch
   upstreamTimeoutMs?: number
   log?: AiDecisionLogFn
@@ -147,7 +161,21 @@ const PLAYER_TYPES = ['human', 'jev'] as const
 const DRAW_REASONS = ['turn', 'draw-two', 'wild-draw-four', 'uno-miss', 'opening-draw-two'] as const
 const SKIP_REASONS = ['skip', 'draw-two', 'wild-draw-four', 'opening-skip', 'opening-draw-two'] as const
 const DECISION_SOURCES = ['jev', 'forced', 'fallback'] as const
-const FALLBACK_REASONS = ['invalid_request', 'rate_limited', 'ai_unavailable', 'invalid_response', 'upstream_error', 'timeout', 'network_error', 'offline'] as const
+const CREDENTIAL_SOURCES = ['site', 'personal'] as const
+const FALLBACK_REASONS = [
+  'invalid_request',
+  'rate_limited',
+  'service_overloaded',
+  'ai_unavailable',
+  'site_quota_exhausted',
+  'personal_key_missing',
+  'personal_key_rejected',
+  'invalid_response',
+  'upstream_error',
+  'timeout',
+  'network_error',
+  'offline',
+] as const
 const EVENT_TYPES = [
   'game-started',
   'opening-color-chosen',
@@ -572,11 +600,13 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
   let request: AiDecisionRequest
   let submittedCandidates: ParsedCandidate[]
   let parsedDecisionId: string | undefined
+  let parsedCredentialSource: 'site' | 'personal' | undefined
+  let credentialSource: 'site' | 'personal'
   try {
     if (!isPlainObject(parsed)) {
       throw new InvalidRequestError('请求体必须是对象')
     }
-    requireExactKeys(parsed, ['protocolVersion', 'rulesVersion', 'gameId', 'revision', 'decisionId', 'actorId', 'view', 'candidates'], '请求体')
+    requireExactKeys(parsed, ['protocolVersion', 'rulesVersion', 'credentialSource', 'gameId', 'revision', 'decisionId', 'actorId', 'view', 'candidates'], '请求体')
     if (parsed.protocolVersion !== AI_PROTOCOL_VERSION) {
       throw new InvalidRequestError(`protocolVersion 必须为 ${AI_PROTOCOL_VERSION}`)
     }
@@ -588,6 +618,8 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
     parsedDecisionId = decisionId
     const revision = requireSafeInt(parsed.revision, 'revision', 0, Number.MAX_SAFE_INTEGER)
     const actorId = requireEnum(parsed.actorId, 'actorId', ['p1', 'p2', 'p3'] as const)
+    credentialSource = requireEnum(parsed.credentialSource, 'credentialSource', CREDENTIAL_SOURCES)
+    parsedCredentialSource = credentialSource
     const view = requireView(parsed.view)
     if (view.actorId !== actorId) {
       throw new InvalidRequestError('view.actorId 必须与顶层 actorId 一致')
@@ -605,6 +637,7 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
     request = {
       protocolVersion: AI_PROTOCOL_VERSION,
       rulesVersion: AI_RULES_VERSION,
+      credentialSource,
       gameId,
       revision,
       decisionId,
@@ -615,7 +648,14 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
   }
   catch (error) {
     if (error instanceof InvalidRequestError) {
-      finishLog({ level: 'error', status: 400, code: 'invalid_request', ...(parsedDecisionId !== undefined ? { decisionId: parsedDecisionId } : {}), detail: error.message })
+      finishLog({
+        level: 'error',
+        status: 400,
+        code: 'invalid_request',
+        ...(parsedDecisionId !== undefined ? { decisionId: parsedDecisionId } : {}),
+        ...(parsedCredentialSource !== undefined ? { credentialSource: parsedCredentialSource } : {}),
+        detail: error.message,
+      })
       return errorResult(400, 'invalid_request', parsedDecisionId)
     }
     throw error
@@ -626,28 +666,61 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
   // 5. 候选集重推导比对：Worker 根据同一受限视角验证候选动作集合、ID 和动作语义一致
   const ctx = buildDecisionContextFromView(request.view)
   if (!ctx) {
-    finishLog({ level: 'error', status: 400, code: 'invalid_request', decisionId })
+    finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId })
     return errorResult(400, 'invalid_request', decisionId)
   }
   const expected = enumerateCandidates(ctx)
   const expectedById = new Map(expected.map(candidate => [candidate.id, candidate.action]))
   if (submittedCandidates.length !== expected.length) {
-    finishLog({ level: 'error', status: 400, code: 'invalid_request', decisionId })
+    finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId })
     return errorResult(400, 'invalid_request', decisionId)
   }
   for (const submitted of submittedCandidates) {
     const expectedAction = expectedById.get(submitted.id)
     if (expectedAction === undefined || !actionsEqual(submitted.action, expectedAction)) {
-      finishLog({ level: 'error', status: 400, code: 'invalid_request', decisionId })
+      finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId })
       return errorResult(400, 'invalid_request', decisionId)
     }
   }
 
-  // 6. 服务端配置检查：缺 key / 模型走受控错误
-  const apiKey = params.runtimeConfig.typesafeApiKey
+  // 6. 凭据选择：协议明确指定来源；个人 Key 仅在当前请求内使用，
+  //    缺少 Key 或格式非法时不得回退站点密钥，也不得轮换 Key 重试
   const model = params.runtimeConfig.typesafeModel
-  if (!apiKey || !model) {
-    finishLog({ level: 'error', status: 503, code: 'ai_unavailable', decisionId, requestedModel: model || undefined })
+  let apiKey: string
+  if (credentialSource === 'personal') {
+    const personalKey = params.personalKey
+    if (personalKey === null) {
+      finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId, detail: 'personal 请求缺少个人 Key 请求头' })
+      return errorResult(400, 'invalid_request', decisionId)
+    }
+    if (personalKey.length > AI_PERSONAL_KEY_MAX_LENGTH || !AI_PERSONAL_KEY_PATTERN.test(personalKey)) {
+      finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId, detail: '个人 Key 格式非法' })
+      return errorResult(400, 'invalid_request', decisionId)
+    }
+    apiKey = personalKey
+  }
+  else {
+    if (params.personalKey !== null) {
+      // 请求体声明站点来源却携带个人 Key 头：来源矛盾，拒绝以避免凭据歧义
+      finishLog({ level: 'error', status: 400, code: 'invalid_request', credentialSource, decisionId, detail: 'site 请求不应携带个人 Key 请求头' })
+      return errorResult(400, 'invalid_request', decisionId)
+    }
+    // 站点额度耗尽只能由运营者显式配置声明：TypeSafe API 无额度耗尽信号，
+    // 不得从 429 / 529 / 鉴权错误猜测。个人 Key 请求不受该开关影响。
+    if (params.runtimeConfig.siteQuotaExhausted) {
+      finishLog({ level: 'error', status: 503, code: 'ai_site_quota_exhausted', credentialSource, decisionId, requestedModel: model || undefined })
+      return errorResult(503, 'ai_site_quota_exhausted', decisionId)
+    }
+    const siteKey = params.runtimeConfig.typesafeApiKey
+    if (!siteKey || !model) {
+      finishLog({ level: 'error', status: 503, code: 'ai_unavailable', credentialSource, decisionId, requestedModel: model || undefined })
+      return errorResult(503, 'ai_unavailable', decisionId)
+    }
+    apiKey = siteKey
+  }
+  if (!model) {
+    // personal 请求同样依赖服务端模型配置（模型与上游地址始终由服务端约束）
+    finishLog({ level: 'error', status: 503, code: 'ai_unavailable', credentialSource, decisionId })
     return errorResult(503, 'ai_unavailable', decisionId)
   }
 
@@ -659,10 +732,10 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
   /** 上游调用失败（连接或正文读取）：区分超时与网络 / 协议错误。 */
   const upstreamFailure = (): AiDecisionHandlerResult => {
     if (controller.signal.aborted) {
-      finishLog({ level: 'error', status: 504, code: 'ai_timeout', decisionId, requestedModel: model })
+      finishLog({ level: 'error', status: 504, code: 'ai_timeout', credentialSource, decisionId, requestedModel: model })
       return errorResult(504, 'ai_timeout', decisionId)
     }
-    finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_upstream_error', decisionId)
   }
   try {
@@ -682,8 +755,8 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
       return upstreamFailure()
     }
 
-    // 8. 上游状态码映射
-    const statusResult = mapUpstreamStatus(response, { decisionId, model, finishLog })
+    // 8. 上游状态码映射（429 限流 / 529 过载 / 401·403 按凭据来源归属）
+    const statusResult = mapUpstreamStatus(response, { decisionId, credentialSource, model, finishLog })
     if (statusResult !== null) {
       return statusResult
     }
@@ -697,35 +770,54 @@ export async function handleAiDecision(params: AiDecisionHandlerParams): Promise
       // 正文读取失败：超时（已 abort）或连接中断
       return upstreamFailure()
     }
-    return handleUpstreamBody(responseText, { request, expectedById, decisionId, model, finishLog })
+    return handleUpstreamBody(responseText, { request, expectedById, decisionId, credentialSource, model, finishLog })
   }
   finally {
     clearTimeout(timer)
   }
 }
 
-/** 上游状态码映射；成功（2xx）返回 null 交由正文处理。 */
+/**
+ * 上游状态码映射；成功（2xx）返回 null 交由正文处理。
+ * 429 与 529 分别映射（调用方限流 / 服务方过载），401/403 按凭据来源归属：
+ * personal 归还 `ai_key_rejected`（用户自己的 Key 无效或无权限），site 保持 `ai_unavailable`。
+ */
 function mapUpstreamStatus(
   response: Response,
-  ctx: { decisionId: string, model: string, finishLog: (entry: Omit<AiDecisionLogEntry, 'event' | 'durationMs'>) => void },
+  ctx: {
+    decisionId: string
+    credentialSource: 'site' | 'personal'
+    model: string
+    finishLog: (entry: Omit<AiDecisionLogEntry, 'event' | 'durationMs'>) => void
+  },
 ): AiDecisionHandlerResult | null {
-  const { decisionId, model, finishLog } = ctx
-  if (response.status === 429 || response.status === 529) {
-    const retryAfterRaw = response.headers.get('retry-after')
-    const retrySeconds = Number.parseInt(retryAfterRaw ?? '', 10)
-    const extra: Record<string, string> = Number.isSafeInteger(retrySeconds) && retrySeconds > 0
-      ? { 'Retry-After': String(retrySeconds) }
-      : {}
-    finishLog({ level: 'error', status: 429, code: 'ai_rate_limited', decisionId, requestedModel: model })
-    return errorResult(429, 'ai_rate_limited', decisionId, extra)
+  const { decisionId, credentialSource, model, finishLog } = ctx
+  const retryAfterExtra = (): Record<string, string> => {
+    const retrySeconds = Number.parseInt(response.headers.get('retry-after') ?? '', 10)
+    return Number.isSafeInteger(retrySeconds) && retrySeconds > 0 ? { 'Retry-After': String(retrySeconds) } : {}
+  }
+  if (response.status === 429) {
+    // 429 = 调用方限流（非额度耗尽）：冷却后可再试
+    finishLog({ level: 'error', status: 429, code: 'ai_rate_limited', credentialSource, decisionId, requestedModel: model })
+    return errorResult(429, 'ai_rate_limited', decisionId, retryAfterExtra())
+  }
+  if (response.status === 529) {
+    // 529 = TypeSafe 服务方暂时过载（非调用方限流、非额度耗尽）
+    finishLog({ level: 'error', status: 503, code: 'ai_overloaded', credentialSource, decisionId, requestedModel: model })
+    return errorResult(503, 'ai_overloaded', decisionId, retryAfterExtra())
   }
   if (response.status === 401 || response.status === 403) {
-    finishLog({ level: 'error', status: 503, code: 'ai_unavailable', decisionId, requestedModel: model })
+    if (credentialSource === 'personal') {
+      // 上游拒绝用户自己的 Key（无效或无权限）：归属个人 Key，不与站点密钥混淆
+      finishLog({ level: 'error', status: 503, code: 'ai_key_rejected', credentialSource, decisionId, requestedModel: model })
+      return errorResult(503, 'ai_key_rejected', decisionId)
+    }
+    finishLog({ level: 'error', status: 503, code: 'ai_unavailable', credentialSource, decisionId, requestedModel: model })
     return errorResult(503, 'ai_unavailable', decisionId)
   }
   if (!response.ok) {
     // 422 与其他上游错误
-    finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_upstream_error', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_upstream_error', decisionId)
   }
   return null
@@ -738,64 +830,65 @@ function handleUpstreamBody(
     request: AiDecisionRequest
     expectedById: Map<string, unknown>
     decisionId: string
+    credentialSource: 'site' | 'personal'
     model: string
     finishLog: (entry: Omit<AiDecisionLogEntry, 'event' | 'durationMs'>) => void
   },
 ): AiDecisionHandlerResult {
-  const { request, expectedById, decisionId, model, finishLog } = ctx
+  const { request, expectedById, decisionId, credentialSource, model, finishLog } = ctx
   let upstream: unknown
   try {
     upstream = JSON.parse(responseText)
   }
   catch {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   if (!isPlainObject(upstream) || typeof upstream.model !== 'string' || upstream.model.length === 0 || upstream.model.length > 64) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   const answers = upstream.answers
   if (!isPlainObject(answers) || !isPlainObject(answers.choose_action)) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   const answer = answers.choose_action
   if (answer.type !== 'choice' || typeof answer.choice !== 'string') {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   if (!expectedById.has(answer.choice)) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   const probabilities = answer.probabilities
   if (!isPlainObject(probabilities)) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   const probKeys = Object.keys(probabilities)
   const expectedIds = [...expectedById.keys()]
   if (probKeys.length !== expectedIds.length || !expectedIds.every(id => id in probabilities)) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   let sum = 0
   for (const id of expectedIds) {
     const p = probabilities[id]
     if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) {
-      finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+      finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
       return errorResult(502, 'ai_invalid_response', decisionId)
     }
     sum += p
   }
   if (Math.abs(sum - 1) > 1e-6) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
   const confidence = answer.confidence
   if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', decisionId, requestedModel: model })
+    finishLog({ level: 'error', status: 502, code: 'ai_invalid_response', credentialSource, decisionId, requestedModel: model })
     return errorResult(502, 'ai_invalid_response', decisionId)
   }
 
@@ -817,6 +910,7 @@ function handleUpstreamBody(
   finishLog({
     level: 'info',
     status: 200,
+    credentialSource,
     decisionId,
     requestedModel: model,
     model: upstream.model,
